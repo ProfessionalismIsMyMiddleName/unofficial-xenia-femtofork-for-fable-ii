@@ -3141,9 +3141,160 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(
           }
         }
       }
+    } else {
+      /* If it's more than 4GB I'll eat my proverbial hat. */
+      uint32_t scaled_length =
+          (uint32_t)texture_cache_->scaled_resolve_current_range_length_scaled_;
+      uint64_t scaled_address =
+          texture_cache_->scaled_resolve_current_range_start_scaled_;
+
+      ID3D12Resource* readback_buffer = RequestReadbackBuffer(scaled_length);
+      if (readback_buffer != nullptr) {
+        size_t resolve_buffer_index =
+            texture_cache_->GetCurrentScaledResolveBufferIndex();
+
+        D3D12TextureCache::ScaledResolveVirtualBuffer* resolve_buffer =
+            texture_cache_->scaled_resolve_2gb_buffers_[resolve_buffer_index]
+                .get();
+
+        assert(resolve_buffer ==
+               &texture_cache_->GetCurrentScaledResolveBuffer());
+
+        PushUAVBarrier(resolve_buffer->resource());
+        texture_cache_->TransitionCurrentScaledResolveRange(
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        SubmitBarriers();
+
+        ID3D12Resource* shared_memory_buffer = resolve_buffer->resource();
+
+        deferred_command_list_.D3DCopyBufferRegion(
+            readback_buffer, 0, shared_memory_buffer,
+            /* The scaled-address is relative across all the 2GB buffers,
+               but here we need it to be relative to this specific buffer. */
+            (scaled_address - (uint64_t(resolve_buffer_index) << 30)),
+            scaled_length);
+
+        if (AwaitAllQueueOperationsCompletion()) {
+          D3D12_RANGE readback_range;
+          readback_range.Begin = 0;
+          readback_range.End = scaled_length;
+          void* readback_mapping;
+          if (SUCCEEDED(readback_buffer->Map(0, &readback_range,
+                                             &readback_mapping))) {
+            uint8_t* physaddr = memory_->TranslatePhysical(written_address);
+            const uint8_t* source = (const uint8_t*)readback_mapping;
+
+            /* The game's code is expecting the texture to be in its original
+               size, so as resolution-scaling is in effect we need to downscale
+               the texture. We probably should be doing this on the GPU--but
+               I've never so as much as drawn a triangle via OpenGL and
+               performance with 3x3 resolution-scaling on my Radeon 7900 XTX
+               is GPU-bound, so we'll let the CPU pick up the slack.
+               The mid-frame synchronisation causes a much much greater
+               performance hit than the downscaling does regardless. */
+
+            /* Resolved textures are stored in tiles of 32x32 pixels,
+               within each tile the pixels are stored in row-major order,
+               likewise the tiles themselves are stored in row-major order.
+               The up-scaled textures are stored in (32*scale_x)x(32*scale_y)
+               tiles, so to implement our nearest-neighbour downscale we simply
+               take the top-left-most pixel from the corresponding upscaled
+               pixel of the upscaled tile. */
+
+            /* I'm glad that clang-format was standing at the ready
+               to make this code hideous. */
+
+#define TEXTURE_DOWNSCALE(scale_x, scale_y, primitive, bytes_per_pixel,      \
+                          pixel_log2)                                        \
+  for (size_t tile_offset = 0;                                               \
+       tile_offset < (scaled_length / ((scale_x) * (scale_y)));              \
+       tile_offset += 32 * 32 * (bytes_per_pixel)) {                         \
+    for (size_t row = 0; row < 32; ++row) {                                  \
+      for (size_t column = 0; column < 32; ++column) {                       \
+        *(primitive*)(physaddr + tile_offset + (row << (5 + (pixel_log2))) + \
+                      (column << (pixel_log2))) =                            \
+            *(const primitive*)(source +                                     \
+                                (tile_offset * ((scale_x) * (scale_y))) +    \
+                                ((row << (5 + (pixel_log2))) *               \
+                                 ((scale_x) * (scale_y))) +                  \
+                                ((column << (pixel_log2)) *                  \
+                                 ((scale_x) * (scale_y))));                  \
+      }                                                                      \
+    }                                                                        \
+  }
+
+#define TEXTURE_DOWNSCALE_CASE(scale_x, scale_y)                 \
+  switch (pixel_scale) {                                         \
+    case 0:                                                      \
+      TEXTURE_DOWNSCALE(scale_x, scale_y, uint8_t, 1, 0) break;  \
+    case 1:                                                      \
+      TEXTURE_DOWNSCALE(scale_x, scale_y, uint16_t, 2, 1) break; \
+    case 2:                                                      \
+      TEXTURE_DOWNSCALE(scale_x, scale_y, uint32_t, 4, 2) break; \
+    case 3:                                                      \
+      TEXTURE_DOWNSCALE(scale_x, scale_y, uint64_t, 8, 3) break; \
+  }                                                              \
+  break;
+
+            const FormatInfo* format_info =
+                FormatInfo::Get((uint32_t)copy_info.copy_dest_format);
+            uint32_t bits_per_pixel = format_info->bits_per_pixel;
+
+            uint32_t scale_x = texture_cache_->draw_resolution_scale_x();
+            uint32_t scale_y = texture_cache_->draw_resolution_scale_y();
+
+            /* What will those boffins invent next? 4x resolution-scaling?! */
+            assert_true(scale_x >= 1);
+            assert_true(scale_x <= 3);
+            assert_true(scale_y >= 1);
+            assert_true(scale_y <= 3);
+            assert_true((scale_x == 1) != (scale_y == 1));
+
+            uint32_t scale_dispatch = ((scale_x - 1) << 2) | (scale_y - 1);
+
+            /* We handle 8bpp, 16bpp, 32bpp, and 64bpp texture-formats here.
+               None of the 4bpp formats are resolvable, and I highly doubt
+               that the sole resolvable 128bpp format of k_32_32_32_32_FLOAT
+               will see use here.
+               Finally, the only 96bpp format isn't resolvable. */
+            assert(bits_per_pixel == 8 || bits_per_pixel == 16 ||
+                   bits_per_pixel == 32 || bits_per_pixel == 64);
+
+            uint32_t pixel_scale;
+            xe::bit_scan_forward(bits_per_pixel >> 3, &pixel_scale);
+
+            /* Minus 1 because the 1x1-scaling case cannot happen. */
+            switch (scale_dispatch - 1) {
+              case 0b00'01 - 1:
+                TEXTURE_DOWNSCALE_CASE(1, 2)
+              case 0b00'10 - 1:
+                TEXTURE_DOWNSCALE_CASE(1, 3)
+              case 0b00'11 - 1:
+                XE_UNREACHABLE;
+              case 0b01'00 - 1:
+                TEXTURE_DOWNSCALE_CASE(2, 1)
+              case 0b01'01 - 1:
+                TEXTURE_DOWNSCALE_CASE(2, 2)
+              case 0b01'10 - 1:
+                TEXTURE_DOWNSCALE_CASE(2, 3)
+              case 0b01'11 - 1:
+                XE_UNREACHABLE;
+              case 0b10'00 - 1:
+                TEXTURE_DOWNSCALE_CASE(3, 1)
+              case 0b10'01 - 1:
+                TEXTURE_DOWNSCALE_CASE(3, 2)
+              case 0b10'10 - 1:
+                TEXTURE_DOWNSCALE_CASE(3, 3)
+            }
+
+            /* I can offer only my apologies to the instruction-cache. */
+
+            D3D12_RANGE readback_write_range = {};
+            readback_buffer->Unmap(0, &readback_write_range);
+          }
+        }
+      }
     }
-  } else {
-    return false;
   }
   return true;
 }
