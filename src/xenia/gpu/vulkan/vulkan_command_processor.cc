@@ -2164,10 +2164,10 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
-bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
-                                       uint32_t index_count,
-                                       IndexBufferInfo* index_buffer_info,
-                                       bool major_mode_explicit) {
+bool VulkanCommandProcessor::IssueDraw(
+    xenos::PrimitiveType prim_type, uint32_t index_count,
+    IndexBufferInfo* index_buffer_info,
+    ReadbackResolveRequirement readback_resolve) {
 #if XE_UI_VULKAN_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_VULKAN_FINE_GRAINED_DRAW_SCOPES
@@ -2177,7 +2177,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   xenos::ModeControl edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::ModeControl::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    return IssueCopy(readback_resolve);
   }
 
   const ui::vulkan::VulkanProvider::DeviceInfo& device_info =
@@ -2638,7 +2638,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   return true;
 }
 
-bool VulkanCommandProcessor::IssueCopy() {
+bool VulkanCommandProcessor::IssueCopy(
+    ReadbackResolveRequirement readback_resolve) {
 #if XE_UI_VULKAN_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_VULKAN_FINE_GRAINED_DRAW_SCOPES
