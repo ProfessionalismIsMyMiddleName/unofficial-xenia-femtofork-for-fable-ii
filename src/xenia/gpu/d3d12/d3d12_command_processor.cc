@@ -2523,10 +2523,10 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
-bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
-                                      uint32_t index_count,
-                                      IndexBufferInfo* index_buffer_info,
-                                      bool major_mode_explicit) {
+bool D3D12CommandProcessor::IssueDraw(
+    xenos::PrimitiveType primitive_type, uint32_t index_count,
+    IndexBufferInfo* index_buffer_info,
+    ReadbackResolveRequirement readback_resolve) {
 #if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
@@ -2537,7 +2537,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   xenos::ModeControl edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::ModeControl::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    return IssueCopy(readback_resolve);
   }
 
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
@@ -3063,25 +3063,28 @@ void D3D12CommandProcessor::InitializeTrace() {
   }
 }
 
-bool D3D12CommandProcessor::IssueCopy() {
+bool D3D12CommandProcessor::IssueCopy(
+    ReadbackResolveRequirement readback_resolve) {
 #if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   if (!BeginSubmission(true)) {
     return false;
   }
-  if (!GetGPUSetting(GPUSetting::ReadbackResolve)) {
+  XE_LIKELY_IF(readback_resolve == ReadbackResolveRequirement::None) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_,
                                          *texture_cache_, written_address,
                                          written_length);
-  } else {
-    return IssueCopy_ReadbackResolvePath();
   }
-  return true;
+  else {
+    return IssueCopy_ReadbackResolvePath(readback_resolve);
+  }
 }
+
 XE_NOINLINE
-bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(
+    ReadbackResolveRequirement readback_resolve) {
   uint32_t written_address, written_length;
   if (render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                     written_address, written_length)) {

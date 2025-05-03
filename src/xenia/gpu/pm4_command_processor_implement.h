@@ -988,8 +988,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
   return true;
 }
 
+/* |Femtofork for Fable II| We replaced the `viz_query_condition` parameter
+   with `may_require_readback_resolve`, instead of appending
+   `may_require_readback_resolve` as a new parameter,
+   because `viz_query_condition` is unused and four parameters
+   makes for a more efficient ABI than five parameters. */
 bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
-    uint32_t packet, const char* opcode_name, uint32_t viz_query_condition,
+    uint32_t packet, const char* opcode_name, bool may_require_readback_resolve,
     uint32_t count_remaining) XE_RESTRICT {
   // if viz_query_condition != 0, this is a conditional draw based on viz query.
   // This ID matches the one issued in PM4_VIZ_QUERY
@@ -1083,11 +1088,19 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render
       // backends.
+
+
+      ReadbackResolveRequirement readback_resolve;
+
+      if (GetGPUSetting(GPUSetting::ReadbackResolve)) {
+        readback_resolve = ReadbackResolveRequirement::Absolute;
+      } else {
+        readback_resolve = ReadbackResolveRequirement::None;
+      }
+
       draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
           vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-          is_indexed ? &index_buffer_info : nullptr,
-          xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
-                                     vgt_draw_initiator.prim_type));
+          is_indexed ? &index_buffer_info : nullptr, readback_resolve);
       if (!draw_succeeded) {
         XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,
                vgt_draw_initiator.num_indices,
@@ -1117,8 +1130,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_DRAW_INDX(
   }
   uint32_t viz_query_condition = reader_.ReadAndSwap<uint32_t>();
   --count_remaining;
-  return COMMAND_PROCESSOR::ExecutePacketType3Draw(
-      packet, "PM4_DRAW_INDX", viz_query_condition, count_remaining);
+  return COMMAND_PROCESSOR::ExecutePacketType3Draw(packet, "PM4_DRAW_INDX",
+                                                   false, count_remaining);
 }
 
 bool COMMAND_PROCESSOR::ExecutePacketType3_DRAW_INDX_2(
@@ -1126,8 +1139,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_DRAW_INDX_2(
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
   // No viz query token.
-  return COMMAND_PROCESSOR::ExecutePacketType3Draw(packet, "PM4_DRAW_INDX_2", 0,
-                                                   count);
+  return COMMAND_PROCESSOR::ExecutePacketType3Draw(packet, "PM4_DRAW_INDX_2",
+                                                   true, count);
 }
 XE_FORCEINLINE
 bool COMMAND_PROCESSOR::ExecutePacketType3_SET_CONSTANT(
