@@ -49,6 +49,25 @@ hash = "4145F96D2DEE2AB5" # default.xex
         value = 0x01
 
 [[patch]]
+    name = "Skip intro videos"
+    desc = "Prevents the Microsoft and Lionhead logo videos from playing when the game is launched."
+    author = "\"Just Harry\""
+    is_enabled = false
+
+    [[patch.be32]]
+        address = 0x822f4974 # Microsoft logo stack-pointer adjustment.
+        value = 0x60000000 # nop
+    [[patch.be32]]
+        address = 0x822f4978 # Microsoft logo playback call.
+        value = 0x60000000 # nop
+    [[patch.be32]]
+        address = 0x822f499c # Lionhead logo stack-pointer adjustment.
+        value = 0x60000000 # nop
+    [[patch.be32]]
+        address = 0x822f498c # Lionhead logo playback call.
+        value = 0x60000000 # nop
+
+[[patch]]
     name = "High Tick Rate"
     desc = "Doubles tickrate to 30hz. Vastly improves in-game UI framerate. Improves input delay. Minor side effects."
     author = "Guy"
