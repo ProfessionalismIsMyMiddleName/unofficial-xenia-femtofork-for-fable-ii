@@ -1103,7 +1103,20 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
       if (GetGPUSetting(GPUSetting::ReadbackResolve)) {
         readback_resolve = ReadbackResolveRequirement::Absolute;
       } else {
-        readback_resolve = ReadbackResolveRequirement::None;
+        static constexpr uint32_t playerAndDogTexturesAddress = 0x12704000;
+
+        static_assert((uint32_t)ReadbackResolveRequirement::None == 0);
+        static_assert((uint32_t)ReadbackResolveRequirement::Maybe == 1);
+
+        readback_resolve =
+            (ReadbackResolveRequirement)(may_require_readback_resolve &
+                                         ((uint32_t)vgt_draw_initiator
+                                              .prim_type == 0x08) &
+                                         (vgt_draw_initiator.num_indices ==
+                                          0x03) &
+                                         (register_file_->values
+                                              [XE_GPU_REG_RB_COPY_DEST_BASE] ==
+                                          playerAndDogTexturesAddress));
       }
 
       draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
