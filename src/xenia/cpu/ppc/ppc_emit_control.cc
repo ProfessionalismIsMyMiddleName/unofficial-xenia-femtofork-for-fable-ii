@@ -817,6 +817,8 @@ int InstrEmit_mtmsrd(PPCHIRBuilder& f, const InstrData& i) {
   return 0;
 }
 
+int InstrEmit_hack(PPCHIRBuilder& f, const InstrData& i) { return 0; }
+
 void RegisterEmitCategoryControl() {
   XEREGISTERINSTR(bx);
   XEREGISTERINSTR(bcx);
@@ -844,6 +846,7 @@ void RegisterEmitCategoryControl() {
   XEREGISTERINSTR(mfmsr);
   XEREGISTERINSTR(mtmsr);
   XEREGISTERINSTR(mtmsrd);
+  XEREGISTERINSTR(hack);
 }
 
 }  // namespace ppc

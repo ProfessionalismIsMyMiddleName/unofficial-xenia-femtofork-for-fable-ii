@@ -168,7 +168,8 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
     // Synchronize the PPC context as required.
     // This will ensure all registers are saved to the PPC context before this
     // instruction executes.
-    if (opcode_info.type == PPCOpcodeType::kSync) {
+    if ((opcode_info.type == PPCOpcodeType::kSync) |
+        ((code & 0xFC000001) == 0x58000001)) {
       ContextBarrier();
     }
 
