@@ -319,11 +319,12 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info,
-                 bool major_mode_explicit) override;
+                 ReadbackResolveRequirement readback_resolve) override;
 
-  bool IssueCopy() override;
+  bool IssueCopy(ReadbackResolveRequirement readback_resolve) override;
   XE_NOINLINE
-  bool IssueCopy_ReadbackResolvePath();
+  bool IssueCopy_ReadbackResolvePath(
+      ReadbackResolveRequirement readback_resolve);
   void InitializeTrace() override;
 
  private:

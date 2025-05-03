@@ -42,6 +42,8 @@ enum class GPUSetting {
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 
+enum class ReadbackResolveRequirement { None = 0, Maybe = 1, Absolute = 2 };
+
 class GraphicsSystem;
 class Shader;
 
@@ -239,12 +241,18 @@ class CommandProcessor {
     return nullptr;
   }
 
+  /* |Femtofork for Fable II| We replaced the `major_mode_explicit` parameter
+     with `readback_resolve`, instead of appending `readback_resolve`
+     as a new parameter, because `major_mode_explicit` is unused and four
+     parameters makes for a more efficient ABI than five parameters. */
   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                          IndexBufferInfo* index_buffer_info,
-                         bool major_mode_explicit) {
+                         ReadbackResolveRequirement readback_resolve) {
     return false;
   }
-  virtual bool IssueCopy() { return false; }
+  virtual bool IssueCopy(ReadbackResolveRequirement readback_resolve) {
+    return false;
+  }
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
