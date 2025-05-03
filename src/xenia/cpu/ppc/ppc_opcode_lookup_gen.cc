@@ -300,6 +300,7 @@ PPCOpcode LookupOpcode(uint32_t code) {
     PPC_DECODER_MISS;
   case 20: PPC_DECODER_HIT(rlwimix);
   case 21: PPC_DECODER_HIT(rlwinmx);
+  case 22: PPC_DECODER_HIT(hack);
   case 23: PPC_DECODER_HIT(rlwnmx);
   case 24: PPC_DECODER_HIT(ori);
   case 25: PPC_DECODER_HIT(oris);
