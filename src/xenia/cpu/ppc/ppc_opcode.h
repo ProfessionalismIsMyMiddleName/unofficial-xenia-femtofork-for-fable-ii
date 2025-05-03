@@ -92,6 +92,7 @@ enum class PPCOpcode : uint32_t {
   fsqrtx,
   fsubsx,
   fsubx,
+  hack,
   icbi,
   isync,
   lbz,

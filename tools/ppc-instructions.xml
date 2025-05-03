@@ -576,6 +576,12 @@
     <out field="FPSCR" />
     <disasm>fsubs[Rc] [FD], [FA], [FB]</disasm>
   </insn>
+  <insn mnem="hack"         opcode="58000000" form="I"        group="b" desc="Evil game-specific hack">
+    <in field="LK" />
+    <in field="AA" />
+    <in field="ADDR" />
+    <disasm>hack[LK][AA] [ADDR]</disasm>
+  </insn>
   <insn mnem="icbi"         opcode="7c0007ac" form="X"        group="m" desc="Instruction Cache Block Invalidate">
     <in field="RA0" />
     <in field="RB" />
