@@ -37,16 +37,6 @@ hash = "4145F96D2DEE2AB5" # default.xex
         value = 0x01
 
 [[patch]]
-    name = "Disable Texture Morphing"
-    desc = "Workaround for the dog's & the hero's broken textures. Makeup is still bugged. Can make morphs look strange."
-    author = "Guy"
-    is_enabled = false
-
-    [[patch.be16]]
-        address = 0x8220ef10
-        value = 0x4280
-
-[[patch]]
     name = "High Tick Rate"
     desc = "Doubles tickrate to 30hz. Vastly improves in-game UI framerate. Improves input delay. Minor side effects."
     author = "Guy"
