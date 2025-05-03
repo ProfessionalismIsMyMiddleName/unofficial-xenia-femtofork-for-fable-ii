@@ -27,6 +27,18 @@ hash = "4145F96D2DEE2AB5" # default.xex
         address = 0x8238df5a
         value = 0x0500
 
+# This patch came from the description of Guy's "Fable 2 PC Ultimate Guide". Cheers, Guy.
+# https://www.youtube.com/watch?v=98ACUnkzqx0
+[[patch]]
+    name = "600p Resolution (Fixes Strobe)"
+    desc = "This resolution fixes the strobing light at the cost of some visual fidelity. Compatible with Margen's 1280x720 patch."
+    author = "Guy"
+    is_enabled = false
+
+    [[patch.be8]]
+        address = 0x8238df4f
+        value = 0x58
+
 [[patch]]
     name = "Disable MSAA (Multi-Sample Anti-Aliasing)"
     author = "Margen67"
