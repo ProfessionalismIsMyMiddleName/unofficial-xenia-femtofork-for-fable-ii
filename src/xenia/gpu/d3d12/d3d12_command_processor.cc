@@ -3086,10 +3086,36 @@ XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(
     ReadbackResolveRequirement readback_resolve) {
   uint32_t written_address, written_length;
-  if (render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                    written_address, written_length)) {
-    if (!texture_cache_->IsDrawResolutionScaled() && written_length) {
-      // Read the resolved data on the CPU.
+  XE_LIKELY_IF(render_target_cache_->Resolve(*memory_, *shared_memory_,
+                                             *texture_cache_, written_address,
+                                             written_length)) {
+    XE_UNLIKELY_IF(written_length == 0) { return false; }
+
+    auto copy_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+
+    XE_LIKELY_IF(readback_resolve == ReadbackResolveRequirement::Maybe) {
+      auto copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
+      bool is_depth_copy =
+          copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
+
+      /* Depth copies are irrelevant for the black-texture-bug. */
+      XE_UNLIKELY_IF(is_depth_copy) { return true; }
+
+      /* I've only observed the `k_8_8_8_8` and `k_1_5_5_5` texture
+         formats being used for the textures affected by the
+         black-texture-bug (not really a bug, but it's a catchy name).
+         The `k_1_5_5_5` format is copied very frequently,
+         whereas the `k_8_8_8_8` format is copied infrequently.
+         Only the `k_8_8_8_8` format requires readback,
+         so we'll readback only it to minimise the performance impact. */
+
+      XE_LIKELY_IF(copy_info.copy_dest_format !=
+                   xenos::ColorFormat::k_8_8_8_8) {
+        return true;
+      }
+    }
+
+    if (!texture_cache_->IsDrawResolutionScaled()) {
       ID3D12Resource* readback_buffer = RequestReadbackBuffer(written_length);
       if (readback_buffer != nullptr) {
         shared_memory_->UseAsCopySource();
