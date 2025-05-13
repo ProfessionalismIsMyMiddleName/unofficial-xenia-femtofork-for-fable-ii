@@ -8,6 +8,7 @@
  */
 
 #include "xenia/base/logging.h"
+#include "xenia/f2/features.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -76,6 +77,110 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
     root_entry = root_file->entry();
   }
+
+  /* To implement automatic backups of save files, we read our own copy
+     of the save file every time the game opens the file for reading,
+     and then write out that copy every time the game opens the file for writing.
+     We do it this way because Fable II blasts away the save file by the time
+     it opens it for writing. */
+  if (desired_access & (xe::filesystem::FileAccess::kGenericRead |
+                        xe::filesystem::FileAccess::kFileReadData)) {
+    size_t fileIndex = 0;
+
+    for (;
+         fileIndex < xe::f2::active_save_file_backup.eligible_file_paths.size();
+         ++fileIndex) {
+      if (target_path.compare(
+              xe::f2::active_save_file_backup.eligible_file_paths[fileIndex]) ==
+          0) {
+        goto reading_save_file_for_later_backup;
+      }
+    }
+
+    goto not_eligible_for_save_backup;
+  reading_save_file_for_later_backup:
+    vfs::File* save_file;
+    vfs::FileAction file_action;
+    X_STATUS result = kernel_state()->file_system()->OpenFile(
+        root_entry, target_path, vfs::FileDisposition::kOpen,
+        xe::filesystem::FileAccess::kGenericRead, false, true, &save_file,
+        &file_action);
+    if (XSUCCEEDED(result)) {
+      std::unique_ptr<xe::vfs::File> opened_save_file =
+          std::unique_ptr<xe::vfs::File>(save_file);
+
+      std::vector<uint8_t>& buffer =
+          xe::f2::active_save_file_backup.file_contents[fileIndex];
+
+      size_t size = opened_save_file->entry()->size();
+
+      buffer.resize(size);
+
+      size_t bytes_read;
+      opened_save_file->ReadSync(buffer.data(), size, 0, &bytes_read);
+    }
+  } else if (desired_access & (xe::filesystem::FileAccess::kGenericWrite |
+                               xe::filesystem::FileAccess::kFileWriteData)) {
+    size_t fileIndex = 0;
+
+    for (;
+         fileIndex < xe::f2::active_save_file_backup.eligible_file_paths.size();
+         ++fileIndex) {
+      if (target_path.compare(
+              xe::f2::active_save_file_backup.eligible_file_paths[fileIndex]) ==
+          0) {
+        goto backing_up_save_file;
+      }
+    }
+
+    goto not_eligible_for_save_backup;
+  backing_up_save_file:
+    auto base_path = xe::utf8::find_base_guest_path(target_path);
+    xe::vfs::Entry* parent_entry =
+        !root_entry ? kernel_state()->file_system()->ResolvePath(base_path)
+                    : root_entry->ResolvePath(base_path);
+
+    if (parent_entry == nullptr) {
+      /* This shouldn't happen,
+         but I shan't cause a crash just before the game saves for my hubris. */
+      goto not_eligible_for_save_backup;
+    }
+
+    std::vector<uint8_t>& buffer =
+        xe::f2::active_save_file_backup.file_contents[fileIndex];
+
+    if (buffer.size() == 0) {
+      goto not_eligible_for_save_backup;
+    }
+
+    auto backup_name = fmt::format(
+        "{}.{:%Y-%m-%d_%H_%M_%S}.bak",
+        /* Plus 6 to account for the 'save:\' prefix. */
+        std::string_view(target_path.data() + 6, target_path.size() - 6),
+        std::chrono::utc_clock::now());
+
+    xe::vfs::Entry* backup_entry = parent_entry->CreateEntry(
+        backup_name, xe::vfs::FileAttributeFlags::kFileAttributeNormal);
+
+    if (backup_entry == nullptr) {
+      goto not_eligible_for_save_backup;
+    }
+
+    xe::vfs::File* backup_file;
+
+    if (XFAILED(backup_entry->Open(xe::filesystem::FileAccess::kGenericWrite,
+                                   &backup_file))) {
+      goto not_eligible_for_save_backup;
+    }
+
+    std::unique_ptr<xe::vfs::File> opened_backup_file =
+        std::unique_ptr<xe::vfs::File>(backup_file);
+
+    size_t bytes_written;
+    opened_backup_file->WriteSync(buffer.data(), buffer.size(), 0,
+                                  &bytes_written);
+  }
+not_eligible_for_save_backup:
 
   // Attempt open (or create).
   vfs::File* vfs_file;
