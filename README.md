@@ -10,6 +10,8 @@ Put briefly, these are the changes made by this fork:
 	- This applies even when resolution-scaling is active.
 	- This applies only to the D3D12 renderer. The black-texture-bug still occurs with the Vulkan renderer (the ground is transparent with the Vulkan renderer, regardless).
 - There are a few additional patches included in the `4D5307F1 - Fable II (GOTY_Platinum Edition).patch.toml` file.
+- Save files are automatically backed up, to guard against save file corruption.
+	- Just before the game overwrites a save file, a copy of that file will be made beside it, with a file-name of `<original-name>.<date-and-time-in-UTC>.bak`.
 
 ## Caveats
 
