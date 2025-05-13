@@ -30,9 +30,25 @@ Avoid playing games other than Fable II with this fork—who knows what the game
 
 ### Migrating from Xenia Canary to this fork
 
+See the [out-of-place section](#out-of-place) for moving game saves over to a fresh installation of Xenia. \
+Otherwise, see the [in-place section](#in-place) for migrating over an existing installation of Xenia.
+
+#### Out-of-place
+
+Copy the `content` folder from your Xenia Canary installation (in the same folder as `xenia_canary.exe` is in) to your folder for this fork's installation.
+
+To save storage space, you only need to copy the sub-folders for Fable II's saves and achievements, which are the in the following sub-folders:
+- Game saves: `content/<numbers and letters for your gamer profile>/<game ID>`
+	- For Fable II's GOTY/Platinum Edition the game ID is `4D5307F1`.
+- Achievement data: `content/<numbers and letters for your gamer profile>/FFFE07D1`
+
+#### In-place
+
 It is recommended that you make a copy of the folder that your installation of Xenia Canary resides in, instead of overwriting its files.
 
 Simply replace the existing files of Xenia Canary with the files you downloaded for this fork.
+
+You may need to delete the `cache_host/shaders` folder, wherein the cached shaders are found, as the cached shaders may cause the black-texture-bug to linger.
 
 If you had configured game patches previously, you will need to reconfigure them if you overwrote the `patches` folder.
 
