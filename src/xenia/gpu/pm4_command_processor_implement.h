@@ -1103,8 +1103,6 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
       if (GetGPUSetting(GPUSetting::ReadbackResolve)) {
         readback_resolve = ReadbackResolveRequirement::Absolute;
       } else {
-        static constexpr uint32_t playerAndDogTexturesAddress = 0x12704000;
-
         static_assert((uint32_t)ReadbackResolveRequirement::None == 0);
         static_assert((uint32_t)ReadbackResolveRequirement::Maybe == 1);
 
@@ -1116,7 +1114,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
                                           0x03) &
                                          (register_file_->values
                                               [XE_GPU_REG_RB_COPY_DEST_BASE] ==
-                                          playerAndDogTexturesAddress));
+                                          xe::f2::
+                                              player_and_dog_textures_address));
       }
 
       draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
