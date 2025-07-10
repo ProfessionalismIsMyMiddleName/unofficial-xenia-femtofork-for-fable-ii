@@ -117,7 +117,7 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
       buffer.resize(size);
 
       size_t bytes_read;
-      opened_save_file->ReadSync(buffer.data(), size, 0, &bytes_read);
+      opened_save_file->ReadSync({buffer.data(), size}, 0, &bytes_read);
     }
   } else if (desired_access & (xe::filesystem::FileAccess::kGenericWrite |
                                xe::filesystem::FileAccess::kFileWriteData)) {
@@ -177,7 +177,7 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
         std::unique_ptr<xe::vfs::File>(backup_file);
 
     size_t bytes_written;
-    opened_backup_file->WriteSync(buffer.data(), buffer.size(), 0,
+    opened_backup_file->WriteSync({buffer.data(), buffer.size()}, 0,
                                   &bytes_written);
   }
 not_eligible_for_save_backup:
