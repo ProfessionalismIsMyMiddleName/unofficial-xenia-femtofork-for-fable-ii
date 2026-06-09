@@ -296,7 +296,7 @@ inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
 }
 #else
 inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
-  int i = ffs(v);
+  int i = __builtin_ffs(v);
   *out_first_set_index = i - 1;
   return i != 0;
 }
@@ -315,11 +315,19 @@ inline bool bit_scan_forward(int64_t v, uint32_t* out_first_set_index) {
 
 template <typename T>
 inline T log2_floor(T v) {
-  return sizeof(T) * 8 - 1 - lzcnt(v);
+  if constexpr (sizeof(T) <= sizeof(uint32_t)) {
+    return sizeof(T) * 8 - 1 - lzcnt(static_cast<uint32_t>(v));
+  } else {
+    return sizeof(T) * 8 - 1 - lzcnt(static_cast<uint64_t>(v));
+  }
 }
 template <typename T>
 inline T log2_ceil(T v) {
-  return sizeof(T) * 8 - lzcnt(v - 1);
+  if constexpr (sizeof(T) <= sizeof(uint32_t)) {
+    return sizeof(T) * 8 - lzcnt(static_cast<uint32_t>(v - 1));
+  } else {
+    return sizeof(T) * 8 - lzcnt(static_cast<uint64_t>(v - 1));
+  }
 }
 
 template <typename T>
@@ -629,7 +637,7 @@ static constexpr uint32_t PregenerateUint32Div(uint32_t _denom,
     int s;
   } magu{};
   magu.a = 0;
-  nc = -1 - ((uint32_t) - (int32_t)d) % d;
+  nc = -1 - ((uint32_t)-(int32_t)d) % d;
   p = 31;
   q1 = 0x80000000 / nc;
   r1 = 0x80000000 - q1 * nc;

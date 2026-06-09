@@ -9,7 +9,6 @@
 
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
-#include <algorithm>
 #include <cstddef>
 #include "third_party/capstone/include/capstone/capstone.h"
 #include "third_party/capstone/include/capstone/x86.h"
@@ -27,11 +26,7 @@
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/cpu/xex_module.h"
 
-DEFINE_bool(record_mmio_access_exceptions, true,
-            "For guest addresses records whether we caught any mmio accesses "
-            "for them. This info can then be used on a subsequent run to "
-            "instruct the recompiler to emit checks",
-            "x64");
+DECLARE_bool(record_mmio_access_exceptions);
 
 DEFINE_int64(max_stackpoints, 65536,
              "Max number of host->guest stack mappings we can record.", "x64");
@@ -667,7 +662,7 @@ HostToGuestThunk X64HelperEmitter::EmitHostToGuestThunk() {
   mov(rdx, qword[rsp + 8 * 2]);
   mov(r8, qword[rsp + 8 * 3]);
   ret();
-#elif XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+#else
   // System-V ABI args:
   // rdi = target
   // rsi = arg0 (context)
@@ -694,10 +689,14 @@ HostToGuestThunk X64HelperEmitter::EmitHostToGuestThunk() {
   EmitSaveNonvolatileRegs();
 
   mov(rax, rdi);
-  // mov(rsi, rsi);   // context
+  // Save context register (RSI is volatile on Linux/Mac System V ABI, but we
+  // need it preserved)
+  mov(qword[rsp + offsetof(StackLayout::Thunk, xmm[0])], rsi);
   mov(rdi, ptr[rsi + offsetof(ppc::PPCContext, virtual_membase)]);  // membase
   mov(rcx, rdx);  // return address
   call(rax);
+  // Restore context register
+  mov(rsi, qword[rsp + offsetof(StackLayout::Thunk, xmm[0])]);
 
   EmitLoadNonvolatileRegs();
 
@@ -705,8 +704,6 @@ HostToGuestThunk X64HelperEmitter::EmitHostToGuestThunk() {
 
   add(rsp, stack_size);
   ret();
-#else
-  assert_always("Unknown platform ABI in host to guest thunk!");
 #endif
 
   code_offsets.tail = getSize();
@@ -754,12 +751,15 @@ GuestToHostThunk X64HelperEmitter::EmitGuestToHostThunk() {
   call(rax);
 
   EmitLoadVolatileRegs();
+  // Host callbacks may change MXCSR. Restore the guest scalar rounding mode
+  // so later guest FP ops observe the correct PPC rounding state.
+  vldmxcsr(GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)));
 
   code_offsets.epilog = getSize();
 
   add(rsp, stack_size);
   ret();
-#elif XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+#else
   // This function is being called using the Microsoft ABI from CallNative
   // rcx = target function
   // rdx = arg0
@@ -802,13 +802,14 @@ GuestToHostThunk X64HelperEmitter::EmitGuestToHostThunk() {
   call(rax);
 
   EmitLoadVolatileRegs();
+  // Host callbacks may change MXCSR. Restore the guest scalar rounding mode
+  // so later guest FP ops observe the correct PPC rounding state.
+  vldmxcsr(GetBackendCtxPtr(offsetof(X64BackendContext, mxcsr_fpu)));
 
   code_offsets.epilog = getSize();
 
   add(rsp, stack_size);
   ret();
-#else
-  assert_always("Unknown platform ABI in guest to host thunk!")
 #endif
 
   code_offsets.tail = getSize();
@@ -862,7 +863,7 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
 
   add(rsp, stack_size);
   jmp(rax);
-#elif XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+#else
   // Function is called with the following params:
   // ebx = target PPC address
   // rsi = context
@@ -901,8 +902,6 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
 
   add(rsp, stack_size);
   jmp(rax);
-#else
-  assert_always("Unknown platform ABI in resolve function!");
 #endif
 
   code_offsets.tail = getSize();
@@ -1617,11 +1616,11 @@ void X64HelperEmitter::EmitSaveVolatileRegs() {
   mov(qword[rsp + offsetof(StackLayout::Thunk, r[8])], r11);
 
   // vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[0])], xmm0);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[1])], xmm1);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[2])], xmm2);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[3])], xmm3);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[4])], xmm4);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[5])], xmm5);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[1])], xmm1);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[2])], xmm2);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[3])], xmm3);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[4])], xmm4);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[5])], xmm5);
 }
 
 void X64HelperEmitter::EmitLoadVolatileRegs() {
@@ -1638,11 +1637,11 @@ void X64HelperEmitter::EmitLoadVolatileRegs() {
   mov(r11, qword[rsp + offsetof(StackLayout::Thunk, r[8])]);
 
   // vmovaps(xmm0, qword[rsp + offsetof(StackLayout::Thunk, xmm[0])]);
-  vmovaps(xmm1, qword[rsp + offsetof(StackLayout::Thunk, xmm[1])]);
-  vmovaps(xmm2, qword[rsp + offsetof(StackLayout::Thunk, xmm[2])]);
-  vmovaps(xmm3, qword[rsp + offsetof(StackLayout::Thunk, xmm[3])]);
-  vmovaps(xmm4, qword[rsp + offsetof(StackLayout::Thunk, xmm[4])]);
-  vmovaps(xmm5, qword[rsp + offsetof(StackLayout::Thunk, xmm[5])]);
+  vmovups(xmm1, qword[rsp + offsetof(StackLayout::Thunk, xmm[1])]);
+  vmovups(xmm2, qword[rsp + offsetof(StackLayout::Thunk, xmm[2])]);
+  vmovups(xmm3, qword[rsp + offsetof(StackLayout::Thunk, xmm[3])]);
+  vmovups(xmm4, qword[rsp + offsetof(StackLayout::Thunk, xmm[4])]);
+  vmovups(xmm5, qword[rsp + offsetof(StackLayout::Thunk, xmm[5])]);
 }
 
 void X64HelperEmitter::EmitSaveNonvolatileRegs() {
@@ -1660,16 +1659,16 @@ void X64HelperEmitter::EmitSaveNonvolatileRegs() {
 
   // SysV does not have nonvolatile XMM registers.
 #if XE_PLATFORM_WIN32
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[0])], xmm6);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[1])], xmm7);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[2])], xmm8);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[3])], xmm9);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[4])], xmm10);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[5])], xmm11);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[6])], xmm12);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[7])], xmm13);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[8])], xmm14);
-  vmovaps(qword[rsp + offsetof(StackLayout::Thunk, xmm[9])], xmm15);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[0])], xmm6);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[1])], xmm7);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[2])], xmm8);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[3])], xmm9);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[4])], xmm10);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[5])], xmm11);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[6])], xmm12);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[7])], xmm13);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[8])], xmm14);
+  vmovups(qword[rsp + offsetof(StackLayout::Thunk, xmm[9])], xmm15);
 #endif
 }
 
@@ -1687,16 +1686,16 @@ void X64HelperEmitter::EmitLoadNonvolatileRegs() {
   mov(r15, qword[rsp + offsetof(StackLayout::Thunk, r[8])]);
 
 #if XE_PLATFORM_WIN32
-  vmovaps(xmm6, qword[rsp + offsetof(StackLayout::Thunk, xmm[0])]);
-  vmovaps(xmm7, qword[rsp + offsetof(StackLayout::Thunk, xmm[1])]);
-  vmovaps(xmm8, qword[rsp + offsetof(StackLayout::Thunk, xmm[2])]);
-  vmovaps(xmm9, qword[rsp + offsetof(StackLayout::Thunk, xmm[3])]);
-  vmovaps(xmm10, qword[rsp + offsetof(StackLayout::Thunk, xmm[4])]);
-  vmovaps(xmm11, qword[rsp + offsetof(StackLayout::Thunk, xmm[5])]);
-  vmovaps(xmm12, qword[rsp + offsetof(StackLayout::Thunk, xmm[6])]);
-  vmovaps(xmm13, qword[rsp + offsetof(StackLayout::Thunk, xmm[7])]);
-  vmovaps(xmm14, qword[rsp + offsetof(StackLayout::Thunk, xmm[8])]);
-  vmovaps(xmm15, qword[rsp + offsetof(StackLayout::Thunk, xmm[9])]);
+  vmovups(xmm6, qword[rsp + offsetof(StackLayout::Thunk, xmm[0])]);
+  vmovups(xmm7, qword[rsp + offsetof(StackLayout::Thunk, xmm[1])]);
+  vmovups(xmm8, qword[rsp + offsetof(StackLayout::Thunk, xmm[2])]);
+  vmovups(xmm9, qword[rsp + offsetof(StackLayout::Thunk, xmm[3])]);
+  vmovups(xmm10, qword[rsp + offsetof(StackLayout::Thunk, xmm[4])]);
+  vmovups(xmm11, qword[rsp + offsetof(StackLayout::Thunk, xmm[5])]);
+  vmovups(xmm12, qword[rsp + offsetof(StackLayout::Thunk, xmm[6])]);
+  vmovups(xmm13, qword[rsp + offsetof(StackLayout::Thunk, xmm[7])]);
+  vmovups(xmm14, qword[rsp + offsetof(StackLayout::Thunk, xmm[8])]);
+  vmovups(xmm15, qword[rsp + offsetof(StackLayout::Thunk, xmm[9])]);
 #endif
 }
 void X64Backend::InitializeBackendContext(void* ctx) {

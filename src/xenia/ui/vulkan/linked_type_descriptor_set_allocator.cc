@@ -9,10 +9,6 @@
 
 #include "xenia/ui/vulkan/linked_type_descriptor_set_allocator.h"
 
-#include <algorithm>
-#include <iterator>
-#include <utility>
-
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
@@ -22,8 +18,8 @@ namespace ui {
 namespace vulkan {
 
 void LinkedTypeDescriptorSetAllocator::Reset() {
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider_.dfn();
-  VkDevice device = provider_.device();
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          page_usable_latest_.pool);
   page_usable_latest_.descriptors_remaining.reset();
@@ -53,8 +49,8 @@ VkDescriptorSet LinkedTypeDescriptorSetAllocator::Allocate(
   }
 #endif
 
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider_.dfn();
-  VkDevice device = provider_.device();
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
 
   VkDescriptorSetAllocateInfo descriptor_set_allocate_info;
   descriptor_set_allocate_info.sType =

@@ -8,9 +8,9 @@
  */
 
 #include "xenia/kernel/xam/apps/xgi_app.h"
+#include "xenia/kernel/xsession.h"
 
 #include "xenia/base/logging.h"
-#include "xenia/base/threading.h"
 
 namespace xe {
 namespace kernel {
@@ -24,10 +24,29 @@ namespace apps {
  * https://github.com/NicolasDe/AlienSwarm/blob/master/src/common/xbox/xboxstubs.h
  */
 
-struct XGI_XUSER_ACHIEVEMENT {
-  xe::be<uint32_t> user_idx;
+struct X_USER_ACHIEVEMENT {
+  xe::be<uint32_t> user_index;
   xe::be<uint32_t> achievement_id;
 };
+static_assert_size(X_USER_ACHIEVEMENT, 0x8);
+
+struct XGI_WRITEACHIEVEMENT {
+  xe::be<uint32_t> num_achievements;
+  xe::be<uint32_t> achievements_ptr;  // X_USER_ACHIEVEMENT*
+};
+static_assert_size(XGI_WRITEACHIEVEMENT, 0x8);
+
+struct X_USER_AVATAR_ASSET {
+  xe::be<uint32_t> user_index;
+  xe::be<uint32_t> award_id;
+};
+static_assert_size(X_USER_AVATAR_ASSET, 0x8);
+
+struct XGI_AWARD_AVATAR_ASSETS {
+  xe::be<uint32_t> num_assets;
+  xe::be<uint32_t> assets_ptr;  // X_USER_AVATAR_ASSET*
+};
+static_assert_size(XGI_AWARD_AVATAR_ASSETS, 0x8);
 
 struct XGI_XUSER_GET_PROPERTY {
   xe::be<uint32_t> user_index;
@@ -39,6 +58,7 @@ struct XGI_XUSER_GET_PROPERTY {
   xe::be<uint32_t> context_address;
   xe::be<uint32_t> property_address;
 };
+static_assert_size(XGI_XUSER_GET_PROPERTY, 0x20);
 
 struct XGI_XUSER_SET_CONTEXT {
   xe::be<uint32_t> user_index;
@@ -46,6 +66,7 @@ struct XGI_XUSER_SET_CONTEXT {
   xe::be<uint64_t> xuid;
   XUSER_CONTEXT context;
 };
+static_assert_size(XGI_XUSER_SET_CONTEXT, 0x18);
 
 struct XGI_XUSER_SET_PROPERTY {
   xe::be<uint32_t> user_index;
@@ -55,6 +76,7 @@ struct XGI_XUSER_SET_PROPERTY {
   xe::be<uint32_t> data_size;
   xe::be<uint32_t> data_address;
 };
+static_assert_size(XGI_XUSER_SET_PROPERTY, 0x20);
 
 struct XUSER_STATS_VIEW {
   xe::be<uint32_t> ViewId;
@@ -116,6 +138,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0007: {
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XGI_XUSER_SET_PROPERTY));
       const XGI_XUSER_SET_PROPERTY* xgi_property =
           reinterpret_cast<const XGI_XUSER_SET_PROPERTY*>(buffer);
 
@@ -144,19 +168,28 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0008: {
-      assert_true(!buffer_length || buffer_length == 8);
-      uint32_t achievement_count = xe::load_and_swap<uint32_t>(buffer + 0);
-      uint32_t achievements_ptr = xe::load_and_swap<uint32_t>(buffer + 4);
-      XELOGD("XGIUserWriteAchievements({:08X}, {:08X})", achievement_count,
-             achievements_ptr);
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(X_USER_ACHIEVEMENT));
 
-      auto* achievement =
-          memory_->TranslateVirtual<XGI_XUSER_ACHIEVEMENT*>(achievements_ptr);
-      for (uint32_t i = 0; i < achievement_count; i++, achievement++) {
+      const XGI_WRITEACHIEVEMENT* write_achievements =
+          reinterpret_cast<const XGI_WRITEACHIEVEMENT*>(buffer);
+
+      const X_USER_ACHIEVEMENT* achievements =
+          memory_->TranslateVirtual<X_USER_ACHIEVEMENT*>(
+              write_achievements->achievements_ptr);
+
+      XELOGD("XGIUserWriteAchievements({:08X}, {:08X})",
+             write_achievements->num_achievements.get(),
+             write_achievements->achievements_ptr.get());
+
+      for (uint32_t i = 0; i < write_achievements->num_achievements; i++) {
+        const X_USER_ACHIEVEMENT& achievement = achievements[i];
+
         kernel_state_->achievement_manager()->EarnAchievement(
-            achievement->user_idx, kernel_state_->title_id(),
-            achievement->achievement_id);
+            achievement.user_index, kernel_state_->title_id(),
+            achievement.achievement_id);
       }
+
       return X_E_SUCCESS;
     }
     case 0x000B0010: {
@@ -181,6 +214,18 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "{:08X})",
           session_ptr, flags, num_slots_public, num_slots_private, user_xuid,
           session_info_ptr, nonce_ptr);
+
+      // 584107FB expects offline session creation using flags 0 to succeed
+      // while offline.
+      // 58410889 expects stats session creation failure while offline.
+      //
+      // Allow offline session creation, but do not allow Xbox Live featured
+      // session creation.
+
+      if (IsXboxLiveSession(static_cast<SessionFlags>(flags))) {
+        return 0x80155209;  // X_ONLINE_E_SESSION_NOT_LOGGED_ON
+      }
+
       return X_E_SUCCESS;
     }
     case 0x000B0011: {
@@ -226,16 +271,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         xe::be<uint32_t> results_guest_address;
       }* data = reinterpret_cast<XUserReadStats*>(buffer);
 
-      if (!data->results_guest_address) {
-        return 1;
-      }
+      return 0x80151802;  // X_ONLINE_E_LOGON_NOT_LOGGED_ON
     }
     case 0x000B0036: {
       // Called after opening xbox live arcade and clicking on xbox live v5759
       // to 5787 and called after clicking xbox live in the game library from
       // v6683 to v6717
-      XELOGD("XGIUnkB0036({:08X}, {:08X}), unimplemented", buffer_ptr,
-             buffer_length);
+      // Does not get sent a buffer
+      XELOGD("XInvalidateGamerTileCache, unimplemented");
       return X_E_FAIL;
     }
     case 0x000B003D: {
@@ -304,8 +347,31 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           property);
     }
     case 0x000B0071: {
-      XELOGD("XGIUnkB0071({:08X}, {:08X}), unimplemented", buffer_ptr,
-             buffer_length);
+      assert_true(!buffer_length ||
+                  buffer_length == sizeof(XGI_AWARD_AVATAR_ASSETS));
+      const XGI_AWARD_AVATAR_ASSETS* award_avatar_assets =
+          reinterpret_cast<const XGI_AWARD_AVATAR_ASSETS*>(buffer);
+
+      XELOGD("XUserAwardAvatarAssets({:08X}, {:08X})",
+             award_avatar_assets->num_assets.get(),
+             award_avatar_assets->assets_ptr.get());
+
+      const X_USER_AVATAR_ASSET* avatar_assets =
+          memory_->TranslateVirtual<X_USER_AVATAR_ASSET*>(
+              award_avatar_assets->assets_ptr);
+
+      for (uint32_t i = 0; i < award_avatar_assets->num_assets; i++) {
+        const X_USER_AVATAR_ASSET& avatar_asset = avatar_assets[i];
+
+        const auto user =
+            kernel_state_->xam_state()->GetUserProfile(avatar_asset.user_index);
+
+        if (user) {
+          XELOGI("Player: {} Unlocked Avatar Award Asset ID: {}", user->name(),
+                 avatar_asset.award_id.get());
+        }
+      }
+
       return X_E_SUCCESS;
     }
   }

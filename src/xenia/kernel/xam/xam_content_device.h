@@ -10,7 +10,9 @@
 #ifndef XENIA_KERNEL_XAM_XAM_CONTENT_DEVICE_H_
 #define XENIA_KERNEL_XAM_XAM_CONTENT_DEVICE_H_
 
-#include "xenia/xbox.h"
+#include <cstdint>
+#include <string_view>
+#include <vector>
 
 namespace xe {
 namespace kernel {
@@ -19,7 +21,10 @@ namespace xam {
 enum class DeviceType : uint32_t {
   Invalid = 0,
   HDD = 1,
+  MU = 2,  // support removed in 9199
   ODD = 4,
+  TransferCable = 8,
+  USBMASS = 16,  // Added in 8955
 };
 
 enum class DummyDeviceId : uint32_t {

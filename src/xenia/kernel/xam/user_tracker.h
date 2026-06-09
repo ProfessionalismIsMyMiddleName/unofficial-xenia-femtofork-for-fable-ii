@@ -16,6 +16,7 @@
 
 #include "xenia/xbox.h"
 
+#include "xenia/kernel/xam/user_profile.h"
 #include "xenia/kernel/xam/user_settings.h"
 
 namespace xe {
@@ -34,7 +35,7 @@ struct TitleInfo {
   X_XDBF_AVATARAWARDS_COUNTER all_avatar_awards;
   X_XDBF_AVATARAWARDS_COUNTER male_avatar_awards;
   X_XDBF_AVATARAWARDS_COUNTER female_avatar_awards;
-  std::chrono::local_time<std::chrono::system_clock::duration> last_played;
+  std::chrono::sys_time<std::chrono::system_clock::duration> last_played;
 
   std::span<const uint8_t> icon;
 
@@ -45,8 +46,8 @@ struct TitleInfo {
 
 class UserTracker {
  public:
-  UserTracker();
-  ~UserTracker();
+  UserTracker() = default;
+  ~UserTracker() = default;
 
   // UserTracker specific methods
   bool AddUser(uint64_t xuid);
@@ -75,12 +76,16 @@ class UserTracker {
   void UpsertSetting(uint64_t xuid, uint32_t title_id,
                      const UserSetting* setting);
 
+  std::optional<UserSetting> GetSetting(UserProfile* user, uint32_t title_id,
+                                        uint32_t setting_id) const;
+
   bool GetUserSetting(uint64_t xuid, uint32_t title_id, uint32_t setting_id,
                       X_USER_PROFILE_SETTING* setting_ptr,
                       uint32_t& extended_data_address) const;
 
   // Titles
   void AddTitleToPlayedList();
+  void RemoveTitleFromPlayedList(uint64_t xuid, uint32_t title_id);
   std::vector<TitleInfo> GetPlayedTitles(uint64_t xuid) const;
   std::optional<TitleInfo> GetUserTitleInfo(uint64_t xuid,
                                             uint32_t title_id) const;
@@ -92,6 +97,8 @@ class UserTracker {
                                               uint32_t achievement_id) const;
 
   // Images
+  bool UpdateUserIcon(uint64_t xuid, std::span<const uint8_t> icon_data);
+
   std::span<const uint8_t> GetIcon(uint64_t xuid, uint32_t title_id,
                                    XTileType tile_type, uint64_t tile_id) const;
 
@@ -100,9 +107,6 @@ class UserTracker {
 
   void UpdateSettingValue(uint64_t xuid, uint32_t title_id,
                           UserSettingId setting_id, int32_t difference);
-
-  std::optional<UserSetting> GetSetting(UserProfile* user, uint32_t title_id,
-                                        uint32_t setting_id) const;
   std::optional<UserSetting> GetGpdSetting(UserProfile* user, uint32_t title_id,
                                            uint32_t setting_id) const;
 
@@ -113,7 +117,7 @@ class UserTracker {
 
   void FlushUserData(const uint64_t xuid);
 
-  SpaInfo* spa_data_;
+  SpaInfo* spa_data_ = nullptr;
 
   std::set<uint64_t> tracked_xuids_;
 };

@@ -9,10 +9,6 @@
 
 #include "xenia/kernel/xam/content_manager.h"
 
-#include <array>
-#include <string>
-#include <unordered_set>
-
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
@@ -255,8 +251,8 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContentODD(
       fmt::format("{:08X}", static_cast<uint32_t>(content_type));
 
   const std::filesystem::path game_content_path =
-      std::filesystem::path("GAME:") / "content" / xuid_str / title_id_str /
-      content_type_str;
+      std::filesystem::path(kDefaultGameSymbolicLink) / "content" / xuid_str /
+      title_id_str / content_type_str;
 
   auto entry = kernel_state_->file_system()->ResolvePath(
       xe::path_to_utf8(game_content_path));
@@ -370,7 +366,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
                                        const XCONTENT_AGGREGATE_DATA& data) {
   auto global_lock = global_critical_region_.Acquire();
 
-  if (open_packages_.count(string_key(root_name))) {
+  if (open_packages_.count(string_key_insensitive(root_name))) {
     // Already content open with this root name.
     return X_ERROR_ALREADY_EXISTS;
   }
@@ -388,7 +384,8 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
   auto package = ResolvePackage(root_name, xuid, data);
   assert_not_null(package);
 
-  open_packages_.insert({string_key::create(root_name), package.release()});
+  open_packages_.insert(
+      {string_key_insensitive::create(root_name), package.release()});
 
   return X_ERROR_SUCCESS;
 }
@@ -400,7 +397,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
                                      const uint32_t disc_number) {
   auto global_lock = global_critical_region_.Acquire();
 
-  if (open_packages_.count(string_key(root_name))) {
+  if (open_packages_.count(string_key_insensitive(root_name))) {
     // Already content open with this root name.
     return X_ERROR_ALREADY_EXISTS;
   }
@@ -419,17 +416,21 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
       data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
 
   content_license = package->GetPackageLicense();
+  if (static_cast<uint32_t>(cvars::license_mask) > 1) {
+    content_license |= cvars::license_mask;
+  }
 
   // Check for SPA file in package. Check it only for DLCs
   if (data.content_type == XContentType::kMarketplaceContent) {
     std::string spa_path = fmt::format("{}:\\{}", root_name, kSpaFilename);
     auto spa_update = kernel_state_->file_system()->ResolvePath(spa_path);
     if (spa_update) {
-      kernel_state_->UpdateSpaData(spa_update);
+      UpdateSpaData(spa_update);
     }
   }
 
-  open_packages_.insert({string_key::create(root_name), package.release()});
+  open_packages_.insert(
+      {string_key_insensitive::create(root_name), package.release()});
 
   return X_ERROR_SUCCESS;
 }
@@ -437,7 +438,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   auto global_lock = global_critical_region_.Acquire();
 
-  auto it = open_packages_.find(string_key(root_name));
+  // 415607D6 - Uses XamContentCreate with name "save", but XamContentClose with
+  // "SAVE".
+  auto it = open_packages_.find(string_key_insensitive(root_name));
   if (it == open_packages_.end()) {
     return X_ERROR_FILE_NOT_FOUND;
   }
@@ -513,10 +516,11 @@ std::filesystem::path ContentManager::ResolveGameUserContentPath(
 }
 
 bool ContentManager::IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const {
-  return std::any_of(open_packages_.cbegin(), open_packages_.cend(),
-                     [data](std::pair<string_key, ContentPackage*> content) {
-                       return data == content.second->GetPackageContentData();
-                     });
+  return std::any_of(
+      open_packages_.cbegin(), open_packages_.cend(),
+      [data](std::pair<string_key_insensitive, ContentPackage*> content) {
+        return data == content.second->GetPackageContentData();
+      });
 }
 
 void ContentManager::CloseOpenedFilesFromContent(
@@ -561,6 +565,27 @@ uint64_t ContentManager::GetContentFreeSpace() const {
   }
 
   return drive_stats.free;
+}
+
+bool ContentManager::UpdateSpaData(vfs::Entry* spa_file_update) {
+  vfs::File* file;
+  if (spa_file_update->Open(vfs::FileAccess::kFileReadData, &file) !=
+      X_STATUS_SUCCESS) {
+    return false;
+  }
+
+  std::vector<uint8_t> data(spa_file_update->size());
+
+  size_t read_bytes = 0;
+  if (file->ReadSync(std::span<uint8_t>(data.data(), spa_file_update->size()),
+                     0, &read_bytes) != X_STATUS_SUCCESS) {
+    return false;
+  }
+
+  xam::SpaInfo new_spa_data(std::span<uint8_t>(data.data(), data.size()));
+  kernel_state_->xam_state()->LoadSpaInfo(&new_spa_data);
+  kernel_state_->emulator()->game_info_database()->Update(&new_spa_data);
+  return true;
 }
 
 }  // namespace xam

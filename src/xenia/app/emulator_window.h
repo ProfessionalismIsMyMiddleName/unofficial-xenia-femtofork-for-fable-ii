@@ -29,6 +29,8 @@
 namespace xe {
 namespace app {
 
+class ConsoleSettingsDialog;
+
 struct RecentTitleEntry {
   std::string title_name;
   std::filesystem::path path_to_file;
@@ -93,6 +95,9 @@ class EmulatorWindow {
                  const xe::ui::RawImage& image);
 
   void ToggleProfilesConfigDialog();
+  void ToggleXMPConfigDialog();
+  void ToggleConsoleSettingsDialog();
+
   void SetHotkeysState(bool enabled) { disable_hotkeys_ = !enabled; }
 
   // Types of button functions for hotkeys.
@@ -148,6 +153,8 @@ class EmulatorWindow {
 
     void OnMouseDown(ui::MouseEvent& e) override;
     void OnMouseUp(ui::MouseEvent& e) override;
+
+    void OnUsbDeviceChanged(bool is_arrival) override;
 
    private:
     EmulatorWindow& emulator_window_;
@@ -208,6 +215,26 @@ class EmulatorWindow {
     EmulatorWindow& emulator_window_;
   };
 
+  class XMPConfigDialog final : public ui::ImGuiDialog {
+   public:
+    XMPConfigDialog(ui::ImGuiDrawer* imgui_drawer,
+                    EmulatorWindow& emulator_window)
+        : ui::ImGuiDialog(imgui_drawer), emulator_window_(emulator_window) {
+      if (emulator_window_.emulator_->audio_media_player()) {
+        volume_ = emulator_window_.emulator_->audio_media_player()
+                      ->GetVolume()
+                      ->load();
+      }
+    }
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    EmulatorWindow& emulator_window_;
+    float volume_ = 0.0f;
+  };
+
   explicit EmulatorWindow(Emulator* emulator,
                           ui::WindowedAppContext& app_context, uint32_t width,
                           uint32_t height);
@@ -259,6 +286,7 @@ class EmulatorWindow {
                          bool vibrate = true);
   void GamepadHotKeys();
   void ToggleGPUSetting(gpu::GPUSetting setting);
+  void CycleReadbackResolve();
   void DisplayHotKeysConfig();
 
   static std::string CanonicalizeFileExtension(
@@ -289,10 +317,13 @@ class EmulatorWindow {
   bool initializing_shader_storage_ = false;
 
   std::unique_ptr<DisplayConfigDialog> display_config_dialog_;
+  std::unique_ptr<ConsoleSettingsDialog> console_settings_dialog_;
 
   // Storing pointers and toggling dialog state is useful for broadcasting
   // messages back to guest.
   std::unique_ptr<ProfileConfigDialog> profile_config_dialog_;
+
+  std::unique_ptr<XMPConfigDialog> xmp_config_dialog_;
 
   std::vector<RecentTitleEntry> recently_launched_titles_;
 };

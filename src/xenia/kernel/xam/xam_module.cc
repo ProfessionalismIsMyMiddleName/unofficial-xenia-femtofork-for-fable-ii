@@ -9,8 +9,6 @@
 
 #include "xenia/kernel/xam/xam_module.h"
 
-#include <vector>
-
 #include "xenia/base/math.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_private.h"
@@ -18,23 +16,6 @@
 namespace xe {
 namespace kernel {
 namespace xam {
-
-std::atomic<int> xam_dialogs_shown_ = {0};
-std::atomic<int> xam_nui_dialogs_shown_ = {0};
-
-// FixMe(RodoMa92): Same hack as main_init_posix.cc:40
-//  Force initialization before constructor calling, mimicking
-//  Windows.
-//  Ref:
-//  https://reviews.llvm.org/D12689#243295
-#ifdef XE_PLATFORM_LINUX
-__attribute__((init_priority(101)))
-#endif
-static std::vector<xe::cpu::Export*>
-    xam_exports(4096);
-
-bool xeXamIsUIActive() { return xam_dialogs_shown_ > 0; }
-bool xeXamIsNuiUIActive() { return xam_nui_dialogs_shown_ > 0; }
 
 XamModule::XamModule(Emulator* emulator, KernelState* kernel_state)
     : KernelModule(kernel_state, "xe:\\xam.xex"), loader_data_() {
@@ -47,7 +28,13 @@ XamModule::XamModule(Emulator* emulator, KernelState* kernel_state)
 #undef XE_MODULE_EXPORT_GROUP
 }
 
+static auto& get_xam_exports() {
+  static std::vector<xe::cpu::Export*> xam_exports(4096);
+  return xam_exports;
+}
+
 xe::cpu::Export* RegisterExport_xam(xe::cpu::Export* export_entry) {
+  auto& xam_exports = get_xam_exports();
   assert_true(export_entry->ordinal < xam_exports.size());
   xam_exports[export_entry->ordinal] = export_entry;
   return export_entry;
@@ -60,6 +47,7 @@ static constexpr xe::cpu::Export xam_export_table[] = {
 #include "xenia/kernel/util/export_table_post.inc"
 void XamModule::RegisterExportTable(xe::cpu::ExportResolver* export_resolver) {
   assert_not_null(export_resolver);
+  auto& xam_exports = get_xam_exports();
 
   for (size_t i = 0; i < xe::countof(xam_export_table); ++i) {
     auto& export_entry = xam_export_table[i];
@@ -69,7 +57,7 @@ void XamModule::RegisterExportTable(xe::cpu::ExportResolver* export_resolver) {
           const_cast<xe::cpu::Export*>(&export_entry);
     }
   }
-  export_resolver->RegisterTable("xam.xex", &xam_exports);
+  export_resolver->RegisterTable("xam.xex", &get_xam_exports());
 }
 
 XamModule::~XamModule() {}
@@ -123,13 +111,14 @@ void XamModule::SaveLoaderData() {
   std::string launch_path = loader_data_.launch_path;
 
   auto remove_prefix = [&launch_path](std::string_view prefix) {
-    if (launch_path.compare(0, prefix.length(), prefix) == 0) {
+    if (xe::utf8::lower_ascii(launch_path)
+            .starts_with(xe::utf8::lower_ascii(prefix))) {
       launch_path = launch_path.substr(prefix.length());
     }
   };
 
-  remove_prefix("game:\\");
-  remove_prefix("d:\\");
+  remove_prefix(fmt::format("{}\\", kDefaultGameSymbolicLink));
+  remove_prefix(fmt::format("{}\\", kDefaultPartitionSymbolicLink));
 
   if (host_path.extension() == ".xex") {
     host_path.remove_filename();

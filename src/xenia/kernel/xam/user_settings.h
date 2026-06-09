@@ -15,15 +15,17 @@
 #include <variant>
 #include <vector>
 
-#include "xenia/kernel/xam/profile_manager.h"
+#include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/xam/user_data.h"
-#include "xenia/kernel/xam/user_profile.h"
-
-#include "xenia/xbox.h"
+#include "xenia/kernel/xam/xam.h"
+#include "xenia/kernel/xam/xdbf/gpd_info.h"
 
 namespace xe {
 namespace kernel {
 namespace xam {
+
+enum class X_USER_PROFILE_SETTING_SOURCE : uint32_t;
+struct X_USER_PROFILE_SETTING;
 
 constexpr uint32_t SettingKey(X_USER_DATA_TYPE type, uint16_t size,
                               uint16_t id) {
@@ -99,11 +101,34 @@ enum class UserSettingId : uint32_t {
       X_USER_DATA_TYPE::INT32, sizeof(uint32_t), 0x3E),  // 0x1004003E,
   XPROFILE_GAMERCARD_SERVICE_TYPE_FLAGS = SettingKey(
       X_USER_DATA_TYPE::INT32, sizeof(uint32_t), 0x3F),  // 0x1004003F,
+  XPROFILE_ENABLE_TUTORIALS =
+      SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                 0x40),  // 0x10040040,
+  XPROFILE_ENABLE_SUBTITLES =
+      SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                 0x41),  // 0x10040041,
+  XPROFILE_UNKNOWN_42 = SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                                   0x42),  // 0x10040042,
+  XPROFILE_UNKNOWN_43 = SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                                   0x43),  // 0x10040043,
+  XPROFILE_AIM_SENSITIVITY_XAXIS =
+      SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                 0x44),  // 0x10040044,
+  XPROFILE_AIM_SENSITIVITY_YAXIS =
+      SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                 0x45),  // 0x10040045,
+  XPROFILE_UNKNOWN_46 = SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                                   0x46),  // 0x10040046,
   XPROFILE_TENURE_LEVEL = SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
                                      0x47),  // 0x10040047,
   XPROFILE_TENURE_MILESTONE = SettingKey(
       X_USER_DATA_TYPE::INT32, sizeof(uint32_t), 0x48),  // 0x10040048,
 
+  XPROFILE_UNKNOWN_49 = SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                                   0x49),  // 0x10040049,
+  XPROFILE_SHOW_DAMAGE_INDICATORS =
+      SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                 0x4A),  // 0x1004004A,
   XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS = SettingKey(
       X_USER_DATA_TYPE::INT32, sizeof(uint32_t), 0x4B),  // 0x1004004B,
   XPROFILE_SUBSCRIPTION_PAYMENT_TYPE = SettingKey(
@@ -115,6 +140,11 @@ enum class UserSettingId : uint32_t {
                  0x4E),  // 0x1004004E, set by XamUserNuiEnableBiometric
   XPROFILE_GFWL_VADNORMAL = SettingKey(X_USER_DATA_TYPE::INT32,
                                        sizeof(uint32_t), 0x4F),  // 0x1004004F,
+  XPROFILE_UNKNOWN_50 = SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                                   0x50),  // 0x10040050,
+  XPROFILE_MINIMAP_AUTOROTATE =
+      SettingKey(X_USER_DATA_TYPE::INT32, sizeof(uint32_t),
+                 0x51),  // 0x10040051,
   XPROFILE_BEACONS_SOCIAL_NETWORK_SHARING = SettingKey(
       X_USER_DATA_TYPE::INT32, sizeof(uint32_t), 0x52),  // 0x10040052,
   XPROFILE_USER_PREFERENCES = SettingKey(
@@ -267,7 +297,7 @@ enum class UserSettingId : uint32_t {
                  0x4F),  // 0x7008004F, named "LastOnLIVE" in Velocity
 };
 
-constexpr static std::array<UserSettingId, 104> known_settings = {
+inline constexpr std::array<UserSettingId, 115> known_settings = {
     UserSettingId::XPROFILE_PERMISSIONS,
     UserSettingId::XPROFILE_GAMER_TYPE,
     UserSettingId::XPROFILE_GAMER_YAXIS_INVERSION,
@@ -301,13 +331,24 @@ constexpr static std::array<UserSettingId, 104> known_settings = {
     UserSettingId::XPROFILE_SAVE_WINDOWS_LIVE_PASSWORD,
     UserSettingId::XPROFILE_FRIENDSAPP_SHOW_BUDDIES,
     UserSettingId::XPROFILE_GAMERCARD_SERVICE_TYPE_FLAGS,
+    UserSettingId::XPROFILE_ENABLE_TUTORIALS,
+    UserSettingId::XPROFILE_ENABLE_SUBTITLES,
+    UserSettingId::XPROFILE_UNKNOWN_42,
+    UserSettingId::XPROFILE_UNKNOWN_43,
+    UserSettingId::XPROFILE_AIM_SENSITIVITY_XAXIS,
+    UserSettingId::XPROFILE_AIM_SENSITIVITY_YAXIS,
+    UserSettingId::XPROFILE_UNKNOWN_46,
     UserSettingId::XPROFILE_TENURE_LEVEL,
     UserSettingId::XPROFILE_TENURE_MILESTONE,
+    UserSettingId::XPROFILE_UNKNOWN_49,
+    UserSettingId::XPROFILE_SHOW_DAMAGE_INDICATORS,
     UserSettingId::XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS,
     UserSettingId::XPROFILE_SUBSCRIPTION_PAYMENT_TYPE,
     UserSettingId::XPROFILE_PEC_INFO,
     UserSettingId::XPROFILE_NUI_BIOMETRIC_SIGNIN,
     UserSettingId::XPROFILE_GFWL_VADNORMAL,
+    UserSettingId::XPROFILE_UNKNOWN_50,
+    UserSettingId::XPROFILE_MINIMAP_AUTOROTATE,
     UserSettingId::XPROFILE_BEACONS_SOCIAL_NETWORK_SHARING,
     UserSettingId::XPROFILE_USER_PREFERENCES,
     UserSettingId::XPROFILE_XBOXONE_GAMERSCORE,
@@ -374,12 +415,12 @@ constexpr static std::array<UserSettingId, 104> known_settings = {
     UserSettingId::XPROFILE_LAST_LIVE_SIGNIN,
 };
 
-const static std::set<UserSettingId> title_writable_settings = {
+inline const std::set<UserSettingId> title_writable_settings = {
     UserSettingId::XPROFILE_TITLE_SPECIFIC1,
     UserSettingId::XPROFILE_TITLE_SPECIFIC2,
     UserSettingId::XPROFILE_TITLE_SPECIFIC3};
 
-enum PREFERRED_COLOR_OPTIONS : uint32_t {
+enum PREFERRED_COLOR_OPTIONS : uint8_t {
   PREFERRED_COLOR_NONE,
   PREFERRED_COLOR_BLACK,
   PREFERRED_COLOR_WHITE,
@@ -393,10 +434,82 @@ enum PREFERRED_COLOR_OPTIONS : uint32_t {
   PREFERRED_COLOR_BROWN,
   PREFERRED_COLOR_SILVER
 };
+enum CONTROLLER_VIBRATION_OPTIONS : uint8_t {
+  CONTROLLER_VIBRATION_OFF = 0,
+  CONTROLLER_VIBRATION_ON = 3
+};
+
+enum CONTROL_SENSITIVITY_OPTIONS : uint8_t {
+  CONTROL_SENSITIVITY_MEDIUM = 0,
+  CONTROL_SENSITIVITY_LOW,
+  CONTROL_SENSITIVITY_HIGH
+};
+
+enum GAMER_DIFFICULTY_OPTIONS : uint8_t {
+  GAMER_DIFFICULTY_NORMAL = 0,
+  GAMER_DIFFICULTY_EASY,
+  GAMER_DIFFICULTY_HARD
+};
+
+enum AUTO_AIM_OPTIONS : uint8_t { AUTO_AIM_OFF = 0, AUTO_AIM_ON };
+
+enum AUTO_CENTER_OPTIONS : uint8_t { AUTO_CENTER_OFF = 0, AUTO_CENTER_ON };
+
+enum MOVEMENT_CONTROL_OPTIONS : uint8_t {
+  MOVEMENT_CONTROL_L_THUMBSTICK = 0,
+  MOVEMENT_CONTROL_R_THUMBSTICK
+};
+
+enum YAXIS_INVERSION_OPTIONS : uint8_t {
+  YAXIS_INVERSION_OFF = 0,
+  YAXIS_INVERSION_ON
+};
+
+enum TRANSMISSION_OPTIONS : uint8_t {
+  TRANSMISSION_AUTO = 0,
+  TRANSMISSION_MANUAL
+};
+
+enum CAMERA_LOCATION_OPTIONS : uint8_t {
+  CAMERA_LOCATION_BEHIND = 0,
+  CAMERA_LOCATION_IN_FRONT,
+  CAMERA_LOCATION_INSIDE
+};
+
+enum BRAKE_CONTROL_OPTIONS : uint8_t {
+  BRAKE_CONTROL_TRIGGER = 0,
+  BRAKE_CONTROL_BUTTON
+};
+
+enum ACCELERATOR_CONTROL_OPTIONS : uint8_t {
+  ACCELERATOR_CONTROL_TRIGGER = 0,
+  ACCELERATOR_CONTROL_BUTTON
+};
+
+struct GamerPictureKey {
+  char title_id[8];
+  char big_tile_id[8];
+  char small_tile_id[8];
+
+  uint32_t GetTitleId() const {
+    return string_util::from_string<uint32_t>(
+        std::string(title_id, std::size(title_id)), true);
+  }
+
+  uint32_t GetBigTileId() const {
+    return string_util::from_string<uint32_t>(
+        std::string(big_tile_id, std::size(big_tile_id)), true);
+  }
+
+  uint32_t GetSmallTileId() const {
+    return string_util::from_string<uint32_t>(
+        std::string(small_tile_id, std::size(small_tile_id)), true);
+  }
+};
+static_assert_size(GamerPictureKey, 0x18);
 
 class UserSetting : public UserData {
  public:
-  UserSetting(UserSetting& setting);
   UserSetting(const UserSetting& setting);
   // Ctor for writing from host
   UserSetting(UserSettingId setting_id, UserDataTypes setting_data);
@@ -406,8 +519,7 @@ class UserSetting : public UserData {
   UserSetting(const X_XDBF_GPD_SETTING_HEADER* profile_setting,
               std::span<const uint8_t> extended_data);
 
-  static std::optional<UserSetting> GetDefaultSetting(const UserProfile* user,
-                                                      uint32_t setting_id);
+  static std::optional<UserSetting> GetDefaultSetting(uint32_t setting_id);
   void WriteToGuest(X_USER_PROFILE_SETTING* setting_ptr,
                     uint32_t& extended_data_address);
   std::vector<uint8_t> Serialize() const;
@@ -448,6 +560,15 @@ class UserSetting : public UserData {
     return is_title_specific(static_cast<uint32_t>(setting_id_));
   }
 };
+
+const static std::array<UserSetting, 3> default_setting_values = {
+    UserSetting(UserSettingId::XPROFILE_OPTION_CONTROLLER_VIBRATION, 3),
+    UserSetting(
+        UserSettingId::XPROFILE_GAMER_TIER,
+        X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierGold),
+    UserSetting(
+        UserSettingId::XPROFILE_GAMERCARD_PICTURE_KEY,
+        xe::string_util::read_u16string_and_swap(u"FFFE07D10002000200010002"))};
 
 }  // namespace xam
 }  // namespace kernel

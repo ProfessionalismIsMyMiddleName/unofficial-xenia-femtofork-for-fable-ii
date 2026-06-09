@@ -11,6 +11,7 @@
 
 #include <cfloat>
 #include <cstring>
+#include <ranges>
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/assert.h"
@@ -28,6 +29,14 @@
 
 #if XE_PLATFORM_WIN32
 #include <ShlObj_core.h>
+#endif
+
+#if XE_PLATFORM_LINUX
+#include <fontconfig/fontconfig.h>
+#endif
+
+#ifdef XE_PLATFORM_LINUX
+#include <gtk/gtk.h>
 #endif
 
 DEFINE_path(
@@ -133,17 +142,38 @@ void ImGuiDrawer::RemoveNotification(ImGuiNotification* dialog) {
   DetachIfLastWindowRemoved();
 }
 
+#ifdef XE_PLATFORM_LINUX
+static void SetClipboardText(void* user_data, const char* text) {
+  GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+  gtk_clipboard_set_text(clipboard, text, -1);
+}
+
+static const char* GetClipboardText(void* user_data) {
+  GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+  return gtk_clipboard_wait_for_text(clipboard);
+}
+#endif
+
 void ImGuiDrawer::Initialize() {
   // Setup ImGui internal state.
   // This will give us state we can swap to the ImGui globals when in use.
   internal_state_ = ImGui::CreateContext();
   ImGui::SetCurrentContext(internal_state_);
 
+  auto& io = ImGui::GetIO();
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
   const float font_size = std::max((float)cvars::font_size, 8.f);
   const float title_font_size = font_size + 6.f;
 
   InitializeFonts(font_size);
   InitializeFonts(title_font_size);
+
+#ifdef XE_PLATFORM_LINUX
+  io.SetClipboardTextFn = SetClipboardText;
+  io.GetClipboardTextFn = GetClipboardText;
+#endif
 
   auto& style = ImGui::GetStyle();
   style.ScrollbarRounding = 6.0f;
@@ -188,9 +218,9 @@ void ImGuiDrawer::Initialize() {
   style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(1.00f, 1.00f, 1.00f, 0.90f);
   style.Colors[ImGuiCol_Tab] = style.Colors[ImGuiCol_Button];
   style.Colors[ImGuiCol_TabHovered] = style.Colors[ImGuiCol_ButtonHovered];
-  style.Colors[ImGuiCol_TabActive] = style.Colors[ImGuiCol_ButtonActive];
-  style.Colors[ImGuiCol_TabUnfocused] = style.Colors[ImGuiCol_FrameBg];
-  style.Colors[ImGuiCol_TabUnfocusedActive] =
+  style.Colors[ImGuiCol_TabSelected] = style.Colors[ImGuiCol_ButtonActive];
+  style.Colors[ImGuiCol_TabDimmed] = style.Colors[ImGuiCol_FrameBg];
+  style.Colors[ImGuiCol_TabDimmedSelected] =
       style.Colors[ImGuiCol_FrameBgHovered];
   style.Colors[ImGuiCol_PlotLines] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
   style.Colors[ImGuiCol_PlotLinesHovered] = ImVec4(0.90f, 0.70f, 0.00f, 1.00f);
@@ -205,6 +235,18 @@ void ImGuiDrawer::Initialize() {
 
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
+}
+
+void ImGuiDrawer::LoadInputSystem(hid::InputSystem* input_system) {
+  if (input_system_) {
+    return;
+  }
+
+  input_system_ = input_system;
+}
+
+void ImGuiDrawer::SetGuideButtonAction(std::function<void(uint8_t)> func) {
+  onGuidePressFunction_ = func;
 }
 
 std::optional<ImGuiKey> ImGuiDrawer::VirtualKeyToImGuiKey(VirtualKey vkey) {
@@ -248,9 +290,13 @@ std::unique_ptr<ImmediateTexture> ImGuiDrawer::LoadImGuiIcon(
     return {};
   }
 
-  return immediate_drawer_->CreateTexture(
+  auto texture = immediate_drawer_->CreateTexture(
       width, height, ImmediateTextureFilter::kLinear, true,
       reinterpret_cast<uint8_t*>(image_data));
+
+  stbi_image_free(image_data);
+
+  return texture;
 }
 
 std::map<uint32_t, std::unique_ptr<ImmediateTexture>> ImGuiDrawer::LoadIcons(
@@ -287,14 +333,26 @@ void ImGuiDrawer::SetupNotificationTextures() {
     notification_icon_textures_.push_back(immediate_drawer_->CreateTexture(
         width, height, ImmediateTextureFilter::kLinear, true,
         reinterpret_cast<uint8_t*>(image_data)));
+
+    stbi_image_free(image_data);
   }
 }
 
+// https://everythingfonts.com/unicode/maps
 static constexpr ImWchar font_glyph_ranges[] = {
     0x0020, 0x00FF,  // Basic Latin + Latin Supplement
+    0x0100, 0x024F,  // Extended Latin
     0x0370, 0x03FF,  // Greek
     0x0400, 0x04FF,  // Cyrillic
     0x2000, 0x206F,  // General Punctuation
+    0x2070, 0x209F,  // Superscripts & Subscripts
+    0x20A0, 0x20CF,  // Currency Symbols
+    0x2100, 0x214F,  // Letterlike Symbols
+    0x2150, 0x218F,  // Number Forms
+    0x2500, 0x257F,  // Box Drawing
+    0x2580, 0x259F,  // Block Elements
+    0x25A0, 0x25FF,  // Geometric Shapes
+    0x2600, 0x26FF,  // Miscellaneous Symbols
     0,
 };
 
@@ -356,7 +414,6 @@ bool ImGuiDrawer::LoadWindowsFont(ImGuiIO& io, ImFontConfig& font_config,
 }
 
 bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
-  // TODO(benvanik): jp font on other platforms?
 #if XE_PLATFORM_WIN32
   PWSTR fonts_dir;
   HRESULT result = SHGetKnownFolderPath(FOLDERID_Fonts, 0, NULL, &fonts_dir);
@@ -382,6 +439,63 @@ bool ImGuiDrawer::LoadJapaneseFont(ImGuiIO& io, float font_size) {
   CoTaskMemFree(static_cast<void*>(fonts_dir));
   return true;
 #endif
+
+#if XE_PLATFORM_LINUX
+  // On Linux, find and merge CJK font using fontconfig
+  FcConfig* config = FcInitLoadConfigAndFonts();
+  if (!config) {
+    XELOGW(
+        "Unable to initialize fontconfig; CJK characters may not display "
+        "correctly");
+    return false;
+  }
+
+  // Create a pattern to search for fonts with CJK support
+  FcPattern* pattern = FcPatternCreate();
+  FcCharSet* charset = FcCharSetCreate();
+  FcCharSetAddChar(charset, 0x4E00);  // Add a CJK character to the charset
+  FcPatternAddCharSet(pattern, FC_CHARSET, charset);
+
+  // Configure the search
+  FcConfigSubstitute(config, pattern, FcMatchPattern);
+  FcDefaultSubstitute(pattern);
+
+  // Find the best matching font
+  FcResult result;
+  FcPattern* font = FcFontMatch(config, pattern, &result);
+
+  bool success = false;
+  if (font) {
+    FcChar8* file = nullptr;
+    if (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch) {
+      const char* font_path = reinterpret_cast<const char*>(file);
+
+      if (std::filesystem::exists(font_path)) {
+        ImFontConfig jp_font_config;
+        jp_font_config.MergeMode = true;
+        jp_font_config.OversampleH = jp_font_config.OversampleV = 2;
+        jp_font_config.PixelSnapH = true;
+
+        io.Fonts->AddFontFromFileTTF(font_path, font_size, &jp_font_config,
+                                     io.Fonts->GetGlyphRangesJapanese());
+        success = true;
+      }
+    }
+    FcPatternDestroy(font);
+  }
+
+  FcCharSetDestroy(charset);
+  FcPatternDestroy(pattern);
+  FcConfigDestroy(config);
+
+  if (!success) {
+    XELOGW(
+        "Unable to find CJK font; Japanese characters may not display "
+        "correctly");
+  }
+  return success;
+#endif
+
   return false;
 };
 
@@ -450,7 +564,7 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
   if (immediate_drawer_) {
     GetIO().Fonts->TexID = reinterpret_cast<ImTextureID>(nullptr);
     font_texture_.reset();
-
+    locked_achievement_icon_.reset();
     notification_icon_textures_.clear();
   }
   immediate_drawer_ = new_immediate_drawer;
@@ -467,6 +581,8 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
     locked_achievement_icon_ = immediate_drawer_->CreateTexture(
         width, height, ImmediateTextureFilter::kLinear, true,
         reinterpret_cast<uint8_t*>(image_data));
+
+    stbi_image_free(image_data);
   }
 }
 
@@ -504,6 +620,10 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
 
+  if (!dialogs_.empty()) {
+    UpdateGamepads();
+  }
+
   ImGui::NewFrame();
 
   assert_true(!IsDrawingDialogs());
@@ -514,32 +634,25 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   dialog_loop_next_index_ = SIZE_MAX;
 
   if (!notifications_.empty() && are_notifications_enabled_) {
-    std::vector<ui::ImGuiNotification*> guest_notifications = {};
-    std::vector<ui::ImGuiNotification*> host_notifications = {};
+    auto guest_notifications =
+        notifications_ | std::views::filter([](auto* notification) {
+          return notification->GetNotificationType() == NotificationType::Guest;
+        });
 
-    std::copy_if(notifications_.cbegin(), notifications_.cend(),
-                 std::back_inserter(guest_notifications),
-                 [](ui::ImGuiNotification* notification) {
-                   return notification->GetNotificationType() ==
-                          NotificationType::Guest;
-                 });
+    auto host_notifications =
+        notifications_ | std::views::filter([](auto* notification) {
+          return notification->GetNotificationType() == NotificationType::Host;
+        });
 
-    std::copy_if(notifications_.cbegin(), notifications_.cend(),
-                 std::back_inserter(host_notifications),
-                 [](ui::ImGuiNotification* notification) {
-                   return notification->GetNotificationType() ==
-                          NotificationType::Host;
-                 });
-
-    if (guest_notifications.size() > 0) {
-      guest_notifications.at(0)->Draw();
+    if (!guest_notifications.empty()) {
+      guest_notifications.front()->Draw();
     }
 
-    if (host_notifications.size() > 0) {
-      host_notifications.at(0)->Draw();
+    if (!host_notifications.empty()) {
+      host_notifications.front()->Draw();
 
-      if (host_notifications.size() > 1) {
-        host_notifications.at(0)->SetDeletionPending();
+      if (std::ranges::distance(host_notifications) > 1) {
+        host_notifications.front()->SetDeletionPending();
       }
     }
   }
@@ -739,7 +852,6 @@ void ImGuiDrawer::ClearInput() {
   io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
   std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
   io.ClearInputKeys();
-  io.ClearInputCharacters();
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
 }
@@ -809,6 +921,125 @@ void ImGuiDrawer::DetachIfLastWindowRemoved() {
   // which will be persistent until new events actualize individual input
   // properties.
   ClearInput();
+}
+
+void ImGuiDrawer::UpdateGamepads() {
+  if (!input_system_) {
+    return;
+  }
+
+  hid::X_INPUT_CAPABILITIES caps = {};
+
+  bool is_gamepad_connected = false;
+
+  for (uint8_t i = 0; i < XUserMaxUserCount; i++) {
+    if (input_system_->GetCapabilities(i, 1, &caps) == X_ERROR_SUCCESS) {
+      // Special case to skip keyboard being set in gamepad mode.
+      if (caps.gamepad.buttons == 0xFFFF &&
+          caps.vibration.left_motor_speed == 0 &&
+          caps.vibration.right_motor_speed == 0) {
+        continue;
+      }
+
+      is_gamepad_connected = true;
+      break;
+    }
+  }
+
+  auto& io = GetIO();
+
+  if (!is_gamepad_connected) {
+    io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+    return;
+  }
+
+  uint8_t controller_to_poke = XUserIndexNone;
+  hid::X_INPUT_STATE gamepad_state;
+  for (uint8_t i = 0; i < XUserMaxUserCount; i++) {
+    if (input_system_->GetState(i, 1, &gamepad_state) == X_ERROR_SUCCESS) {
+      if (gamepad_state.gamepad.buttons != 0) {
+        controller_to_poke = i;
+        break;
+      }
+    }
+  }
+  if (controller_to_poke == XUserIndexNone) {
+    io.ClearInputKeys();
+    return;
+  }
+
+  io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+  hid::X_INPUT_GAMEPAD& gamepad = gamepad_state.gamepad;
+
+  // GUIDE BUTTON - More info needed
+  if (gamepad_state.gamepad.buttons ==
+      hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_GUIDE) {
+    if (onGuidePressFunction_) {
+      onGuidePressFunction_(controller_to_poke);
+    }
+  }
+
+#define IM_SATURATE(V) (V < 0.0f ? 0.0f : V > 1.0f ? 1.0f : V)
+#define MAP_BUTTON(KEY_NO, BUTTON_ENUM)                           \
+  {                                                               \
+    io.AddKeyEvent(KEY_NO, (gamepad.buttons & BUTTON_ENUM) != 0); \
+  }
+#define MAP_ANALOG(KEY_NO, VALUE, V0, V1)                      \
+  {                                                            \
+    float vn = (float)(VALUE - V0) / (float)(V1 - V0);         \
+    io.AddKeyAnalogEvent(KEY_NO, vn > 0.10f, IM_SATURATE(vn)); \
+  }
+
+  MAP_BUTTON(ImGuiKey_GamepadStart,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_START);
+  MAP_BUTTON(ImGuiKey_GamepadBack,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_BACK);
+  MAP_BUTTON(ImGuiKey_GamepadFaceLeft,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_X);
+  MAP_BUTTON(ImGuiKey_GamepadFaceRight,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_B);
+  MAP_BUTTON(ImGuiKey_GamepadFaceUp,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_Y);
+  MAP_BUTTON(ImGuiKey_GamepadFaceDown,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_A);
+  MAP_BUTTON(ImGuiKey_GamepadDpadLeft,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_DPAD_LEFT);
+  MAP_BUTTON(ImGuiKey_GamepadDpadRight,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_DPAD_RIGHT);
+  MAP_BUTTON(ImGuiKey_GamepadDpadUp,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_DPAD_UP);
+  MAP_BUTTON(ImGuiKey_GamepadDpadDown,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_DPAD_DOWN);
+  MAP_BUTTON(ImGuiKey_GamepadL1,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_LEFT_SHOULDER);
+  MAP_BUTTON(ImGuiKey_GamepadR1,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_RIGHT_SHOULDER);
+  MAP_ANALOG(ImGuiKey_GamepadL2, gamepad.left_trigger,
+             hid::X_INPUT_GAMEPAD_TRIGGER_THRESHOLD, 255);
+  MAP_ANALOG(ImGuiKey_GamepadR2, gamepad.right_trigger,
+             hid::X_INPUT_GAMEPAD_TRIGGER_THRESHOLD, 255);
+  MAP_BUTTON(ImGuiKey_GamepadL3,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_LEFT_THUMB);
+  MAP_BUTTON(ImGuiKey_GamepadR3,
+             hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_RIGHT_THUMB);
+  MAP_ANALOG(ImGuiKey_GamepadLStickLeft, gamepad.thumb_lx,
+             -hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
+  MAP_ANALOG(ImGuiKey_GamepadLStickRight, gamepad.thumb_lx,
+             +hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+  MAP_ANALOG(ImGuiKey_GamepadLStickUp, gamepad.thumb_ly,
+             +hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+  MAP_ANALOG(ImGuiKey_GamepadLStickDown, gamepad.thumb_ly,
+             -hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
+  MAP_ANALOG(ImGuiKey_GamepadRStickLeft, gamepad.thumb_rx,
+             -hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
+  MAP_ANALOG(ImGuiKey_GamepadRStickRight, gamepad.thumb_rx,
+             +hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+  MAP_ANALOG(ImGuiKey_GamepadRStickUp, gamepad.thumb_ry,
+             +hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, +32767);
+  MAP_ANALOG(ImGuiKey_GamepadRStickDown, gamepad.thumb_ry,
+             -hid::X_INPUT_GAMEPAD_LEFT_THUMB_DEADZONE, -32768);
+#undef MAP_BUTTON
+#undef MAP_ANALOG
 }
 
 }  // namespace ui

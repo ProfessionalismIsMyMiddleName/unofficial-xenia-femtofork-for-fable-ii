@@ -10,8 +10,6 @@
 #include "xenia/gpu/shader_translator.h"
 
 #include <cstdarg>
-#include <set>
-#include <string>
 
 #include "xenia/base/math.h"
 
@@ -257,7 +255,10 @@ void ParsedVertexFetchInstruction::Disassemble(StringBuffer* out) const {
   static const struct {
     const char* name;
   } kVertexFetchDataFormats[0xff] = {
-#define TYPE(id) {#id}
+#define TYPE(id) \
+  {              \
+    #id          \
+  }
       {0},
       {0},
       {0},

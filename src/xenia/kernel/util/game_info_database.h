@@ -10,6 +10,7 @@
 #ifndef XENIA_KERNEL_UTIL_GAME_INFO_DATABASE_H_
 #define XENIA_KERNEL_UTIL_GAME_INFO_DATABASE_H_
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,16 +23,27 @@ namespace util {
 
 class GameInfoDatabase {
  public:
+  struct PropertyBag {
+    std::set<uint32_t> contexts;
+    std::set<uint32_t> properties;
+  };
+
   struct Context {
     uint32_t id;
     uint32_t max_value;
     uint32_t default_value;
+    bool is_system;
+    bool is_presence;
+    bool is_matchmaking;
     std::string description;
   };
 
   struct Property {
     uint32_t id;
     uint32_t data_size;
+    bool is_system;
+    bool is_presence;
+    bool is_matchmaking;
     std::string description;
   };
 
@@ -43,6 +55,16 @@ class GameInfoDatabase {
     uint32_t image_id;
     uint32_t gamerscore;
     uint32_t flags;
+  };
+
+  struct PresenceMode {
+    uint32_t context_value;
+    PropertyBag property_bag;
+  };
+
+  struct Presence {
+    PropertyBag property_bag;
+    std::vector<PresenceMode> presence_modes;
   };
 
   struct Query {
@@ -60,18 +82,37 @@ class GameInfoDatabase {
   };
 
   struct Field {
-    uint32_t ordinal;
-    std::string name;
-    bool is_hidden;
+    uint32_t property_id;
+    uint32_t flags;
     uint16_t attribute_id;
-    // std::map<property_id, aggregation string>
-    std::map<uint32_t, std::string> property_aggregation;
+    uint16_t aggregation_type;
+    uint8_t ordinal;
+    uint8_t field_type;
+    uint32_t format_type;
+    std::string name;
+  };
+
+  struct SharedView {
+    std::vector<Field> column_entries;
+    std::vector<Field> row_entries;
+    PropertyBag properties;
+  };
+
+  struct View {
+    uint32_t id;
+    bool arbitrated;
+    bool hidden;
+    bool team_view;
+    bool online_only;
+    bool skilled;
+    kernel::xam::ViewType view_type;
+    uint16_t shared_index;
+    std::string name;
   };
 
   struct StatsView {
-    uint32_t id;
-    std::string name;
-    std::vector<Field> fields;
+    View view;
+    SharedView shared_view;
   };
 
   struct ProductInformation {
@@ -88,7 +129,7 @@ class GameInfoDatabase {
   // Normally titles have at least XDBF file embedded into xex. There are
   // certain exceptions and that's why we need to check if it is even valid.
   GameInfoDatabase(const xam::SpaInfo* data);
-  ~GameInfoDatabase();
+  ~GameInfoDatabase() = default;
 
   bool IsValid() const { return is_valid_; }
 
@@ -103,24 +144,35 @@ class GameInfoDatabase {
 
   std::vector<uint8_t> GetIcon() const;
 
-  Context GetContext(const uint32_t id) const;
-  Property GetProperty(const uint32_t id) const;
-  Achievement GetAchievement(const uint32_t id) const;
+  std::optional<GameInfoDatabase::Context> GetContext(const uint32_t id) const;
+  std::optional<GameInfoDatabase::Property> GetProperty(
+      const uint32_t id) const;
+  std::optional<GameInfoDatabase::Achievement> GetAchievement(
+      const uint32_t id) const;
+  PropertyBag GetPropertyBag(const xam::PropertyBag& property_bag) const;
+  Field GetField(const xam::ViewFieldEntry& field_entry) const;
+  std::optional<GameInfoDatabase::StatsView> GetStatsView(
+      const uint32_t id) const;
+  Presence GetPresence() const;
+  std::optional<GameInfoDatabase::PresenceMode> GetPresenceMode(
+      const uint32_t context_value) const;
+  std::vector<PresenceMode> GetPresenceModes(
+      const std::vector<xam::PropertyBag> property_bags) const;
 
   // TODO: Implement it in the future.
-  StatsView GetStatsView(const uint32_t id) const;
   std::vector<uint32_t> GetMatchmakingAttributes(const uint32_t id) const;
 
   // This is extracted from XLast.
   Query GetQueryData(const uint32_t id) const;
   std::vector<XLanguage> GetSupportedLanguages() const;
   ProductInformation GetProductInformation() const;
+  PropertyBag GetMatchmakingCollection() const;
 
   // Aggregators for specific usecases
   std::vector<Context> GetContexts() const;
   std::vector<Property> GetProperties() const;
   std::vector<Achievement> GetAchievements() const;
-  // TODO: Implement it in the future.
+  std::vector<PresenceMode> GetPresenceModes() const;
   std::vector<StatsView> GetStatsViews() const;
 
  private:

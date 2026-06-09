@@ -12,17 +12,19 @@
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/gpu_flags.h"
+#include "xenia/gpu/shared_memory.h"
 
 DEFINE_int32(
     draw_resolution_scale_x, 1,
     "Integer pixel width scale used for scaling the rendering resolution "
     "opaquely to the game.\n"
-    "1, 2 and 3 may be supported, but support of anything above 1 depends on "
-    "the device properties, such as whether it supports sparse binding / tiled "
-    "resources, the number of virtual address bits per resource, and other "
-    "factors.\n"
+    "Values from 1 to 7 may be supported, depending on device capabilities. "
+    "Requires sparse binding (Vulkan) or tiled resources (D3D12) for scales "
+    "above 1x1. The emulator will automatically clamp to the maximum supported "
+    "scale if the requested value exceeds device limits.\n"
     "Various effects and parts of game rendering pipelines may work "
     "incorrectly as pixels become ambiguous from the game's perspective and "
     "because half-pixel offset (which normally doesn't affect coverage when "
@@ -59,82 +61,51 @@ DEFINE_uint32(
     "textures - so with 2x2 resolution scaling, the soft limit will be 360 + "
     "96 MB, and with 3x3, it will be 360 + 216 MB.",
     "GPU");
+DEFINE_bool(tiled_shared_memory, true,
+            "Enable tiled/sparse resources for efficient large address space "
+            "support. Disable for graphics debugger compatibility.",
+            "GPU");
 
 namespace xe {
 namespace gpu {
 
 const TextureCache::LoadShaderInfo
     TextureCache::load_shader_info_[kLoadShaderCount] = {
-        // k8bpb
-        {3, 4, 1, 4},
-        // k16bpb
-        {4, 4, 2, 4},
-        // k32bpb
-        {4, 4, 4, 3},
-        // k64bpb
-        {4, 4, 8, 2},
-        // k128bpb
-        {4, 4, 16, 1},
-        // kR5G5B5A1ToB5G5R5A1
-        {4, 4, 2, 4},
-        // kR5G6B5ToB5G6R5
-        {4, 4, 2, 4},
-        // kR5G5B6ToB5G6R5WithRBGASwizzle
-        {4, 4, 2, 4},
-        // kRGBA4ToBGRA4
-        {4, 4, 2, 4},
-        // kRGBA4ToARGB4
-        {4, 4, 2, 4},
-        // kGBGR8ToGRGB8
-        {4, 4, 4, 3},
-        // kGBGR8ToRGB8
-        {4, 4, 8, 3},
-        // kBGRG8ToRGBG8
-        {4, 4, 4, 3},
-        // kBGRG8ToRGB8
-        {4, 4, 8, 3},
-        // kR10G11B11ToRGBA16
-        {4, 4, 8, 3},
-        // kR10G11B11ToRGBA16SNorm
-        {4, 4, 8, 3},
-        // kR11G11B10ToRGBA16
-        {4, 4, 8, 3},
-        // kR11G11B10ToRGBA16SNorm
-        {4, 4, 8, 3},
-        // kR16UNormToFloat
-        {4, 4, 2, 4},
-        // kR16SNormToFloat
-        {4, 4, 2, 4},
-        // kRG16UNormToFloat
-        {4, 4, 4, 3},
-        // kRG16SNormToFloat
-        {4, 4, 4, 3},
-        // kRGBA16UNormToFloat
-        {4, 4, 8, 2},
-        // kRGBA16SNormToFloat
-        {4, 4, 8, 2},
-        // kDXT1ToRGBA8
-        {4, 4, 4, 2},
-        // kDXT3ToRGBA8
-        {4, 4, 4, 1},
-        // kDXT5ToRGBA8
-        {4, 4, 4, 1},
-        // kDXNToRG8
-        {4, 4, 2, 1},
-        // kDXT3A
-        {4, 4, 1, 2},
-        // kDXT3AAs1111ToBGRA4
-        {4, 4, 2, 2},
-        // kDXT3AAs1111ToARGB4
-        {4, 4, 2, 2},
-        // kDXT5AToR8
-        {4, 4, 1, 2},
-        // kCTX1
-        {4, 4, 2, 2},
-        // kDepthUnorm
-        {4, 4, 4, 3},
-        // kDepthFloat
-        {4, 4, 4, 3},
+        {1, 4},   // k8bpb
+        {2, 4},   // k16bpb
+        {4, 3},   // k32bpb
+        {8, 2},   // k64bpb
+        {16, 1},  // k128bpb
+        {2, 4},   // kR5G5B5A1ToB5G5R5A1
+        {2, 4},   // kR5G6B5ToB5G6R5
+        {2, 4},   // kR5G5B6ToB5G6R5WithRBGASwizzle
+        {2, 4},   // kRGBA4ToBGRA4
+        {2, 4},   // kRGBA4ToARGB4
+        {4, 3},   // kGBGR8ToGRGB8
+        {8, 3},   // kGBGR8ToRGB8
+        {4, 3},   // kBGRG8ToRGBG8
+        {8, 3},   // kBGRG8ToRGB8
+        {8, 3},   // kR10G11B11ToRGBA16
+        {8, 3},   // kR10G11B11ToRGBA16SNorm
+        {8, 3},   // kR11G11B10ToRGBA16
+        {8, 3},   // kR11G11B10ToRGBA16SNorm
+        {2, 4},   // kR16UNormToFloat
+        {2, 4},   // kR16SNormToFloat
+        {4, 3},   // kRG16UNormToFloat
+        {4, 3},   // kRG16SNormToFloat
+        {8, 2},   // kRGBA16UNormToFloat
+        {8, 2},   // kRGBA16SNormToFloat
+        {4, 2},   // kDXT1ToRGBA8
+        {4, 1},   // kDXT3ToRGBA8
+        {4, 1},   // kDXT5ToRGBA8
+        {2, 1},   // kDXNToRG8
+        {1, 2},   // kDXT3A
+        {2, 2},   // kDXT3AAs1111ToBGRA4
+        {2, 2},   // kDXT3AAs1111ToARGB4
+        {1, 2},   // kDXT5AToR8
+        {2, 2},   // kCTX1
+        {4, 3},   // kDepthUnorm
+        {4, 3},   // kDepthFloat
 };
 
 TextureCache::TextureCache(const RegisterFile& register_file,
@@ -185,6 +156,43 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out,
   x_out = clamped_x;
   y_out = clamped_y;
   return clamped_x == config_x && clamped_y == config_y;
+}
+
+bool TextureCache::ClampDrawResolutionScaleToMaxSupported(
+    uint32_t& scale_x, uint32_t& scale_y, bool sparse_bind_supported,
+    uint32_t virtual_address_bits_per_resource) {
+  // Without sparse/tiled resource support, resolution scaling is not possible
+  // because the scaled address space exceeds what simple buffers can handle.
+  if (!sparse_bind_supported) {
+    bool was_clamped = scale_x > 1 || scale_y > 1;
+    scale_x = 1;
+    scale_y = 1;
+    return !was_clamped;
+  }
+
+  // With sparse binding, limit based on virtual address space if specified.
+  bool was_clamped = false;
+  if (virtual_address_bits_per_resource > 0) {
+    while (scale_x > 1 || scale_y > 1) {
+      uint64_t highest_scaled_address =
+          uint64_t(SharedMemory::kBufferSize) * (scale_x * scale_y) - 1;
+      if (uint32_t(64) - xe::lzcnt(highest_scaled_address) <=
+          virtual_address_bits_per_resource) {
+        break;
+      }
+      // When reducing from a square size, prefer decreasing the horizontal
+      // resolution as vertical resolution difference is visible more clearly in
+      // perspective.
+      was_clamped = true;
+      if (scale_x >= scale_y) {
+        --scale_x;
+      } else {
+        --scale_y;
+      }
+    }
+  }
+
+  return !was_clamped;
 }
 
 void TextureCache::ClearCache() { DestroyAllTextures(); }
@@ -286,7 +294,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
 
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
-  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled, true);
+  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle,
@@ -461,22 +469,23 @@ void TextureCache::Texture::LogAction(const char* action) const {
 // performed somehow. The list is maintained by the Texture, not the
 // TextureCache itself (unlike the `textures_` container).
 TextureCache::Texture::Texture(TextureCache& texture_cache,
-                               const TextureKey& key)
+                               const TextureKey& key, bool track_usage)
     : texture_cache_(texture_cache),
       key_(key),
       guest_layout_(key.GetGuestLayout()),
-      base_resolved_(key.scaled_resolve),
-      mips_resolved_(key.scaled_resolve),
       last_usage_submission_index_(texture_cache.current_submission_index_),
       last_usage_time_(texture_cache.current_submission_time_),
-      used_previous_(texture_cache.texture_used_last_),
-      used_next_(nullptr) {
-  if (texture_cache.texture_used_last_) {
-    texture_cache.texture_used_last_->used_next_ = this;
-  } else {
-    texture_cache.texture_used_first_ = this;
+      used_previous_(track_usage ? texture_cache.texture_used_last_ : nullptr),
+      used_next_(nullptr),
+      in_usage_list_(track_usage) {
+  if (track_usage) {
+    if (texture_cache.texture_used_last_) {
+      texture_cache.texture_used_last_->used_next_ = this;
+    } else {
+      texture_cache.texture_used_first_ = this;
+    }
+    texture_cache.texture_used_last_ = this;
   }
-  texture_cache.texture_used_last_ = this;
 
   // Never try to upload data that doesn't exist.
   base_outdated_ = guest_layout().base.level_data_extent_bytes != 0;
@@ -491,15 +500,18 @@ TextureCache::Texture::~Texture() {
     texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
   }
 
-  if (used_previous_) {
-    used_previous_->used_next_ = used_next_;
-  } else {
-    texture_cache_.texture_used_first_ = used_next_;
-  }
-  if (used_next_) {
-    used_next_->used_previous_ = used_previous_;
-  } else {
-    texture_cache_.texture_used_last_ = used_previous_;
+  // Only remove from usage list if we were added to it (track_usage=true).
+  if (in_usage_list_) {
+    if (used_previous_) {
+      used_previous_->used_next_ = used_next_;
+    } else {
+      texture_cache_.texture_used_first_ = used_next_;
+    }
+    if (used_next_) {
+      used_next_->used_previous_ = used_previous_;
+    } else {
+      texture_cache_.texture_used_last_ = used_previous_;
+    }
   }
 
   texture_cache_.UpdateTexturesTotalHostMemoryUsage(0, host_memory_usage_);
@@ -525,6 +537,10 @@ void TextureCache::Texture::MakeUpToDateAndWatch(
 }
 
 void TextureCache::Texture::MarkAsUsed() {
+  // Textures not in usage tracking (track_usage=false) should not be linked.
+  if (!in_usage_list_) {
+    return;
+  }
   assert_true(last_usage_submission_index_ <=
               texture_cache_.current_submission_index_);
   // This is called very frequently, don't relink unless needed for caching.
@@ -650,6 +666,21 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     }
   }
 
+  // Lockless pre-check: count how many textures appear outdated.
+  // If none appear outdated, skip the lock entirely.
+  uint32_t likely_outdated = 0;
+  for (uint32_t i = 0; i < n_textures; ++i) {
+    Texture* current = textures[i];
+    if (current->base_outdated_lockless() ||
+        current->mips_outdated_lockless()) {
+      ++likely_outdated;
+    }
+  }
+  if (likely_outdated == 0) {
+    // All textures appear up-to-date, skip lock acquisition
+    return;
+  }
+
   uint64_t index_base_outdated = 0;
   uint64_t index_mips_outdated = 0;
   uint32_t nkept = 0;
@@ -699,21 +730,17 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     // portion of its pages is invalidated, in this case we'll need the texture
     // from the shared memory to load the unscaled parts.
     // TODO(Triang3l): Load unscaled parts.
-    bool base_resolved = texture.GetBaseResolved();
     if (index_base_outdated & (1ULL << i)) {
       if (!shared_memory().RequestRange(
               texture_key.base_page << 12,
-              xe::align(texture.GetGuestBaseSize(), UINT32_C(16)),
-              texture_key.scaled_resolve ? nullptr : &base_resolved)) {
+              xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
         continue;
       }
     }
-    bool mips_resolved = texture.GetMipsResolved();
     if (index_mips_outdated & (1ULL << i)) {
       if (!shared_memory().RequestRange(
               texture_key.mip_page << 12,
-              xe::align(texture.GetGuestMipsSize(), UINT32_C(16)),
-              texture_key.scaled_resolve ? nullptr : &mips_resolved)) {
+              xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
         continue;
       }
     }
@@ -739,13 +766,6 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       continue;
     }
 
-    // Update the source of the texture (resolve vs. CPU or memexport) for
-    // purposes of handling piecewise gamma emulation via sRGB and for
-    // resolution scale in sampling offsets.
-    if (!texture_key.scaled_resolve) {
-      texture.SetBaseResolved(base_resolved);
-      texture.SetMipsResolved(mips_resolved);
-    }
     // reque for makeuptodatandwatch
     textures[i] = &texture;
   }
@@ -768,6 +788,13 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
   }
 }
 bool TextureCache::LoadTextureData(Texture& texture) {
+  // Lockless pre-check: if texture appears up-to-date, skip the lock.
+  // This is safe because worst case is a false positive (we acquire lock
+  // unnecessarily), never a false negative.
+  if (!texture.base_outdated_lockless() && !texture.mips_outdated_lockless()) {
+    return true;
+  }
+
   // Check what needs to be uploaded.
   bool base_outdated, mips_outdated;
   {
@@ -795,21 +822,17 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // its pages is invalidated, in this case we'll need the texture from the
   // shared memory to load the unscaled parts.
   // TODO(Triang3l): Load unscaled parts.
-  bool base_resolved = texture.GetBaseResolved();
   if (base_outdated) {
     if (!shared_memory().RequestRange(
             texture_key.base_page << 12,
-            xe::align(texture.GetGuestBaseSize(), UINT32_C(16)),
-            texture_key.scaled_resolve ? nullptr : &base_resolved)) {
+            xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
       return false;
     }
   }
-  bool mips_resolved = texture.GetMipsResolved();
   if (mips_outdated) {
     if (!shared_memory().RequestRange(
             texture_key.mip_page << 12,
-            xe::align(texture.GetGuestMipsSize(), UINT32_C(16)),
-            texture_key.scaled_resolve ? nullptr : &mips_resolved)) {
+            xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
       return false;
     }
   }
@@ -832,14 +855,6 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   if (!LoadTextureDataFromResidentMemoryImpl(texture, base_outdated,
                                              mips_outdated)) {
     return false;
-  }
-
-  // Update the source of the texture (resolve vs. CPU or memexport) for
-  // purposes of handling piecewise gamma emulation via sRGB and for resolution
-  // scale in sampling offsets.
-  if (!texture_key.scaled_resolve) {
-    texture.SetBaseResolved(base_resolved);
-    texture.SetMipsResolved(mips_resolved);
   }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
@@ -1052,6 +1067,13 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
   uint32_t resolve_l2_block_last = resolve_block_last >> 6;
   for (uint32_t i = resolve_l2_block_first; i <= resolve_l2_block_last; ++i) {
     uint64_t resolve_l2_block = scaled_resolve_pages_l2_[i];
+    // Pre-mask to only process blocks within the write range.
+    if (i == resolve_l2_block_first) {
+      resolve_l2_block &= ~((UINT64_C(1) << (resolve_block_first & 63)) - 1);
+    }
+    if (i == resolve_l2_block_last && (resolve_block_last & 63) != 63) {
+      resolve_l2_block &= (UINT64_C(1) << ((resolve_block_last & 63) + 1)) - 1;
+    }
     uint32_t resolve_block_relative_index;
     while (
         xe::bit_scan_forward(resolve_l2_block, &resolve_block_relative_index)) {

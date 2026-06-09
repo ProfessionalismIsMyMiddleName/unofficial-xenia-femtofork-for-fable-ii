@@ -9,10 +9,7 @@
 
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 
-#include <algorithm>
 #include <cstring>
-#include <utility>
-#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -21,6 +18,8 @@
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
+
+DECLARE_bool(gpu_allow_invalid_upload_range);
 
 DEFINE_bool(vulkan_sparse_shared_memory, true,
             "Enable sparse binding for shared memory emulation. Disabling it "
@@ -45,14 +44,14 @@ VulkanSharedMemory::VulkanSharedMemory(
 VulkanSharedMemory::~VulkanSharedMemory() { Shutdown(true); }
 
 bool VulkanSharedMemory::Initialize() {
-  InitializeCommon();
+  if (!InitializeCommon()) {
+    return false;
+  }
 
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
-  const ui::vulkan::VulkanProvider::DeviceInfo& device_info =
-      provider.device_info();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
 
   const VkBufferCreateFlags sparse_flags =
       VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
@@ -70,14 +69,15 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (cvars::vulkan_sparse_shared_memory && device_info.sparseResidencyBuffer) {
+  if (cvars::vulkan_sparse_shared_memory &&
+      vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) ==
         VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
       dfn.vkGetBufferMemoryRequirements(device, buffer_,
                                         &buffer_memory_requirements);
       if (xe::bit_scan_forward(buffer_memory_requirements.memoryTypeBits &
-                                   device_info.memory_types_device_local,
+                                   vulkan_device->memory_types().device_local,
                                &buffer_memory_type_)) {
         uint32_t allocation_size_log2;
         xe::bit_scan_forward(
@@ -130,7 +130,7 @@ bool VulkanSharedMemory::Initialize() {
     dfn.vkGetBufferMemoryRequirements(device, buffer_,
                                       &buffer_memory_requirements);
     if (!xe::bit_scan_forward(buffer_memory_requirements.memoryTypeBits &
-                                  device_info.memory_types_device_local,
+                                  vulkan_device->memory_types().device_local,
                               &buffer_memory_type_)) {
       XELOGE(
           "Shared memory: Failed to get a device-local Vulkan memory type for "
@@ -147,7 +147,7 @@ bool VulkanSharedMemory::Initialize() {
         buffer_memory_requirements.size;
     buffer_memory_allocate_info.memoryTypeIndex = buffer_memory_type_;
     VkMemoryDedicatedAllocateInfo buffer_memory_dedicated_allocate_info;
-    if (provider.device_info().ext_1_1_VK_KHR_dedicated_allocation) {
+    if (vulkan_device->extensions().ext_1_1_KHR_dedicated_allocation) {
       buffer_memory_allocate_info_last->pNext =
           &buffer_memory_dedicated_allocate_info;
       buffer_memory_allocate_info_last =
@@ -183,7 +183,7 @@ bool VulkanSharedMemory::Initialize() {
   last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
 
   upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
-      provider, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       xe::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
                 size_t(1) << page_size_log2()));
 
@@ -195,10 +195,10 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
 
   upload_buffer_pool_.reset();
 
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
   for (VkDeviceMemory memory : buffer_memory_) {
@@ -211,6 +211,12 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   if (!from_destructor) {
     ShutdownCommon();
   }
+}
+
+void VulkanSharedMemory::ClearCache() {
+  SharedMemory::ClearCache();
+
+  upload_buffer_pool_->ClearCache();
 }
 
 void VulkanSharedMemory::CompletedSubmissionUpdated() {
@@ -260,10 +266,9 @@ bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
     return false;
   }
 
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          provider, download_page_count << page_size_log2(),
+          command_processor_.GetVulkanDevice(),
+          download_page_count << page_size_log2(),
           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
           ui::vulkan::util::MemoryPurpose::kReadback, trace_download_buffer_,
           trace_download_buffer_memory_)) {
@@ -306,10 +311,10 @@ void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
   if (!trace_download_buffer_memory_) {
     return;
   }
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   void* download_mapping;
   if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE,
                       0, &download_mapping) == VK_SUCCESS) {
@@ -335,10 +340,10 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(
     return true;
   }
 
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
 
   VkMemoryAllocateInfo memory_allocate_info;
   memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -365,7 +370,7 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(
       VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-  if (provider.device_info().tessellationShader) {
+  if (vulkan_device->properties().tessellationShader) {
     bind_wait_stage_mask |=
         VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
   }
@@ -404,6 +409,30 @@ bool VulkanSharedMemory::UploadRanges(
     uint32_t upload_range_length = upload_page_ranges[i].second;
     trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
                                   upload_range_length << page_size_log2());
+
+    if (upload_range_length > 0 && !cvars::gpu_allow_invalid_upload_range) {
+      const uint32_t range_start_addr = upload_range_start << page_size_log2();
+      const uint32_t upload_range_last_page =
+          upload_range_start + upload_range_length - 1;
+      const uint32_t range_end_addr = upload_range_last_page
+                                      << page_size_log2();
+
+      const memory::PageAccess start_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_start_addr,
+                                                       range_start_addr);
+      const memory::PageAccess end_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_end_addr,
+                                                       range_end_addr);
+      if (start_access == xe::memory::PageAccess::kNoAccess ||
+          end_access == xe::memory::PageAccess::kNoAccess) {
+        XELOGE(
+            "Vulkan shared memory: Invalid upload range {:08X} length {:08X}",
+            upload_range_start, upload_range_length);
+        successful = false;
+        break;
+      }
+    }
+
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
@@ -417,11 +446,20 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(),
-                     uint32_t(upload_buffer_size), false, false);
-      std::memcpy(
-          upload_buffer_mapping,
-          memory().TranslatePhysical(upload_range_start << page_size_log2()),
-          upload_buffer_size);
+                     uint32_t(upload_buffer_size), false);
+
+      if (upload_buffer_size < (1ULL << 32) && upload_buffer_size > 8192) {
+        memory::vastcpy(
+            upload_buffer_mapping,
+            memory().TranslatePhysical(upload_range_start << page_size_log2()),
+            static_cast<uint32_t>(upload_buffer_size));
+        swcache::WriteFence();
+      } else {
+        std::memcpy(
+            upload_buffer_mapping,
+            memory().TranslatePhysical(upload_range_start << page_size_log2()),
+            upload_buffer_size);
+      }
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
@@ -460,7 +498,7 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage,
   switch (usage) {
     case Usage::kComputeWrite:
       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
       return;
     case Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -487,10 +525,10 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage,
 }
 
 void VulkanSharedMemory::ResetTraceDownload() {
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
                                          trace_download_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,

@@ -13,7 +13,6 @@
 #include <memory>
 #include <string>
 #include <thread>
-#include <vector>
 
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/app/emulator_window.h"
@@ -37,6 +36,9 @@
 
 // Available audio systems:
 #include "xenia/apu/nop/nop_audio_system.h"
+#if XE_PLATFORM_LINUX
+#include "xenia/apu/alsa/alsa_audio_system.h"
+#endif  // XE_PLATFORM_LINUX
 #if !XE_PLATFORM_ANDROID
 #include "xenia/apu/sdl/sdl_audio_system.h"
 #endif  // !XE_PLATFORM_ANDROID
@@ -46,7 +48,9 @@
 
 // Available graphics systems:
 #include "xenia/gpu/null/null_graphics_system.h"
+#if !XE_PLATFORM_MAC
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
+#endif
 #if XE_PLATFORM_WIN32
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #endif  // XE_PLATFORM_WIN32
@@ -61,11 +65,23 @@
 #include "xenia/hid/xinput/xinput_hid.h"
 #endif  // XE_PLATFORM_WIN32
 
-DEFINE_string(apu, "any", "Audio system. Use: [any, nop, sdl, xaudio2]", "APU");
-DEFINE_string(gpu, "any", "Graphics system. Use: [any, d3d12, vulkan, null]",
-              "GPU");
-DEFINE_string(hid, "any", "Input system. Use: [any, nop, sdl, winkey, xinput]",
-              "HID");
+#if XE_PLATFORM_WIN32
+#define APU_OPTIONS "[any, nop, sdl, xaudio2]"
+#define GPU_OPTIONS "[any, d3d12, vulkan, null]"
+#define HID_OPTIONS "[any, nop, sdl, winkey, xinput]"
+#elif XE_PLATFORM_LINUX
+#define APU_OPTIONS "[any, alsa, nop, sdl]"
+#define GPU_OPTIONS "[any, vulkan, null]"
+#define HID_OPTIONS "[any, nop, sdl]"
+#else
+#define APU_OPTIONS "[any, nop, sdl]"
+#define GPU_OPTIONS "[any, vulkan, null]"
+#define HID_OPTIONS "[any, nop, sdl]"
+#endif
+
+DEFINE_string(apu, "any", "Audio system. Use: " APU_OPTIONS, "APU");
+DEFINE_string(gpu, "any", "Graphics system. Use: " GPU_OPTIONS, "GPU");
+DEFINE_string(hid, "any", "Input system. Use: " HID_OPTIONS, "HID");
 
 DEFINE_path(
     storage_root, "",
@@ -92,6 +108,11 @@ DEFINE_bool(mount_scratch, false, "Enable scratch mount", "Storage");
 DEFINE_bool(mount_cache, true, "Enable cache mount", "Storage");
 UPDATE_from_bool(mount_cache, 2024, 8, 31, 20, false);
 
+DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount",
+            "Storage");
+
+DECLARE_bool(force_mount_devkit);
+
 DEFINE_transient_path(target, "",
                       "Specifies the target .xex or .iso to execute.",
                       "General");
@@ -109,7 +130,8 @@ DECLARE_bool(debug);
 
 DEFINE_bool(discord, true, "Enable Discord rich presence", "General");
 
-DECLARE_bool(widescreen);
+DECLARE_int32(window_size_x);
+DECLARE_int32(window_size_y);
 
 namespace xe {
 namespace app {
@@ -170,9 +192,13 @@ class EmulatorApp final : public xe::ui::WindowedApp {
         return nullptr;
       } else {
         for (const auto& creator : creators_) {
-          if (!creator.is_available()) continue;
+          if (!creator.is_available()) {
+            continue;
+          }
           auto instance = creator.instantiate(std::forward<Args>(args)...);
-          if (!instance) continue;
+          if (!instance) {
+            continue;
+          }
           return instance;
         }
         return nullptr;
@@ -292,6 +318,9 @@ std::unique_ptr<apu::AudioSystem> EmulatorApp::CreateAudioSystem(
 #if XE_PLATFORM_WIN32
   factory.Add<apu::xaudio2::XAudio2AudioSystem>("xaudio2");
 #endif  // XE_PLATFORM_WIN32
+#if XE_PLATFORM_LINUX
+  factory.Add<apu::alsa::ALSAAudioSystem>("alsa");
+#endif  // XE_PLATFORM_LINUX
 #if !XE_PLATFORM_ANDROID
   factory.Add<apu::sdl::SDLAudioSystem>("sdl");
 #endif  // !XE_PLATFORM_ANDROID
@@ -371,13 +400,44 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
   // For maintainability, as much implementation code as possible should be
   // placed in `xe::gpu` and shared between the backends rather than duplicated
   // between them.
+  const std::string gpu_implementation_name = cvars::gpu;
+  if (gpu_implementation_name == "null") {
+    return std::make_unique<gpu::null::NullGraphicsSystem>();
+  }
   Factory<gpu::GraphicsSystem> factory;
 #if XE_PLATFORM_WIN32
   factory.Add<gpu::d3d12::D3D12GraphicsSystem>("d3d12");
 #endif  // XE_PLATFORM_WIN32
+#if !XE_PLATFORM_MAC
   factory.Add<gpu::vulkan::VulkanGraphicsSystem>("vulkan");
-  factory.Add<gpu::null::NullGraphicsSystem>("null");
-  return factory.Create(cvars::gpu);
+#endif
+  std::unique_ptr<gpu::GraphicsSystem> gpu_implementation =
+      factory.Create(gpu_implementation_name);
+  if (!gpu_implementation) {
+    xe::FatalError(
+        "Unable to initialize the graphics subsystem.\n"
+        "\n"
+#if XE_PLATFORM_ANDROID
+        "The GPU must support at least Vulkan 1.0 with the 'independentBlend' "
+        "feature.\n"
+        "\n"
+#else
+#if XE_PLATFORM_WIN32
+        "For Direct3D 12, at least Windows 10 is required, and the GPU must be "
+        "compatible with Direct3D 12 feature level 11_0.\n"
+        "\n"
+#endif  // XE_PLATFORM_WIN32
+        "For Vulkan, the Vulkan runtime must be installed, and the GPU must "
+        "support at least Vulkan 1.0. The Vulkan runtime can be downloaded at "
+        "https://vulkan.lunarg.com/sdk/home.\n"
+        "\n"
+        "Also, ensure that you have the latest driver installed for your GPU.\n"
+        "\n"
+#endif  // XE_PLATFORM_ANDROID
+        "See https://xenia.jp/faq/ for more information and the system "
+        "requirements.");
+  }
+  return gpu_implementation;
 }
 
 std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
@@ -414,9 +474,6 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
 }
 
 bool EmulatorApp::OnInitialize() {
-#if XE_ARCH_AMD64 == 1
-  amd64::InitFeatureFlags();
-#endif
   Profiler::Initialize();
   Profiler::ThreadEnter("Main");
 
@@ -427,12 +484,9 @@ bool EmulatorApp::OnInitialize() {
     if (!cvars::portable &&
         !std::filesystem::exists(storage_root / "portable.txt")) {
       storage_root = xe::filesystem::GetUserFolder();
-#if defined(XE_PLATFORM_WIN32) || defined(XE_PLATFORM_LINUX)
-      storage_root = storage_root / "Xenia";
+#if XE_PLATFORM_ANDROID
+      // TODO(Triang3l): Point to the app's external storage "files" directory.
 #else
-      // TODO(Triang3l): Point to the app's external storage "files" directory
-      // on Android.
-#warning Unhandled platform for the data root.
       storage_root = storage_root / "Xenia";
 #endif
     }
@@ -441,6 +495,12 @@ bool EmulatorApp::OnInitialize() {
   XELOGI("Storage root: {}", storage_root);
 
   config::SetupConfig(storage_root);
+
+#if XE_ARCH_AMD64 == 1
+  amd64::InitFeatureFlags();
+#elif XE_ARCH_ARM64 == 1
+  arm64::InitFeatureFlags();
+#endif
 
   std::filesystem::path content_root = cvars::content_root;
   if (content_root.empty()) {
@@ -479,12 +539,10 @@ bool EmulatorApp::OnInitialize() {
   emulator_ =
       std::make_unique<Emulator>("", storage_root, content_root, cache_root);
 
-  // Determine window size based on user setting.
-  auto res = xe::gpu::GraphicsSystem::GetInternalDisplayResolution();
-
   // Main emulator display window.
-  emulator_window_ = EmulatorWindow::Create(emulator_.get(), app_context(),
-                                            res.first, res.second);
+  emulator_window_ =
+      EmulatorWindow::Create(emulator_.get(), app_context(),
+                             cvars::window_size_x, cvars::window_size_y);
   if (!emulator_window_) {
     XELOGE("Failed to create the main emulator window");
     return false;
@@ -515,6 +573,9 @@ void EmulatorApp::OnDestroy() {
 
   // TODO(DrChat): Remove this code and do a proper exit.
   XELOGI("Cheap-skate exit!");
+
+  xe::FlushLog();
+
   std::quick_exit(EXIT_SUCCESS);
 }
 
@@ -538,43 +599,44 @@ void EmulatorApp::EmulatorThread() {
   app_context().CallInUIThread(
       [this]() { emulator_window_->SetupGraphicsSystemPresenterPainting(); });
 
+  const auto fs = emulator_->file_system();
+
   if (cvars::mount_scratch) {
     auto scratch_device = std::make_unique<xe::vfs::HostPathDevice>(
-        "\\SCRATCH", "scratch", false);
+        "\\SCRATCH", emulator_->storage_root() / "scratch", false);
     if (!scratch_device->Initialize()) {
       XELOGE("Unable to scan scratch path");
     } else {
-      if (!emulator_->file_system()->RegisterDevice(
-              std::move(scratch_device))) {
+      if (!fs->RegisterDevice(std::move(scratch_device))) {
         XELOGE("Unable to register scratch path");
       } else {
-        emulator_->file_system()->RegisterSymbolicLink("scratch:", "\\SCRATCH");
+        fs->RegisterSymbolicLink("scratch:", "\\SCRATCH");
       }
     }
   }
 
   if (cvars::mount_cache) {
-    auto cache0_device =
-        std::make_unique<xe::vfs::HostPathDevice>("\\CACHE0", "cache0", false);
+    auto cache0_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\CACHE0", emulator_->storage_root() / "cache0", false);
     if (!cache0_device->Initialize()) {
       XELOGE("Unable to scan cache0 path");
     } else {
-      if (!emulator_->file_system()->RegisterDevice(std::move(cache0_device))) {
+      if (!fs->RegisterDevice(std::move(cache0_device))) {
         XELOGE("Unable to register cache0 path");
       } else {
-        emulator_->file_system()->RegisterSymbolicLink("cache0:", "\\CACHE0");
+        fs->RegisterSymbolicLink("cache0:", "\\CACHE0");
       }
     }
 
-    auto cache1_device =
-        std::make_unique<xe::vfs::HostPathDevice>("\\CACHE1", "cache1", false);
+    auto cache1_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\CACHE1", emulator_->storage_root() / "cache1", false);
     if (!cache1_device->Initialize()) {
       XELOGE("Unable to scan cache1 path");
     } else {
-      if (!emulator_->file_system()->RegisterDevice(std::move(cache1_device))) {
+      if (!fs->RegisterDevice(std::move(cache1_device))) {
         XELOGE("Unable to register cache1 path");
       } else {
-        emulator_->file_system()->RegisterSymbolicLink("cache1:", "\\CACHE1");
+        fs->RegisterSymbolicLink("cache1:", "\\CACHE1");
       }
     }
 
@@ -582,17 +644,48 @@ void EmulatorApp::EmulatorThread() {
     // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
     // substring/start_with logic inside VirtualFileSystem::ResolvePath, else
     // accesses to those devices will go here instead
-    auto cache_device =
-        std::make_unique<xe::vfs::HostPathDevice>("\\CACHE", "cache", false);
+    auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\CACHE", emulator_->storage_root() / "cache", false);
     if (!cache_device->Initialize()) {
       XELOGE("Unable to scan cache path");
     } else {
-      if (!emulator_->file_system()->RegisterDevice(std::move(cache_device))) {
+      if (!fs->RegisterDevice(std::move(cache_device))) {
         XELOGE("Unable to register cache path");
       } else {
-        emulator_->file_system()->RegisterSymbolicLink("cache:", "\\CACHE");
+        fs->RegisterSymbolicLink("cache:", "\\CACHE");
       }
     }
+  }
+
+  if (cvars::force_mount_devkit) {
+    auto devkit_device =
+        std::make_unique<xe::vfs::HostPathDevice>("\\DEVKIT", "devkit", false);
+
+    if (!devkit_device->Initialize()) {
+      XELOGE("Unable to scan devkit path");
+    }
+
+    if (!fs->RegisterDevice(std::move(devkit_device))) {
+      XELOGE("Unable to register devkit path");
+    }
+
+    fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
+    fs->RegisterSymbolicLink("e:", "\\DEVKIT");
+  }
+
+  if (cvars::mount_memory_unit) {
+    auto mu_device =
+        std::make_unique<xe::vfs::HostPathDevice>("\\MU", "MU", false);
+
+    if (!mu_device->Initialize()) {
+      XELOGE("Unable to scan MU path");
+    }
+
+    if (!fs->RegisterDevice(std::move(mu_device))) {
+      XELOGE("Unable to register MU path");
+    }
+
+    fs->RegisterSymbolicLink("MU:", "\\MU");
   }
 
   // Set a debug handler.

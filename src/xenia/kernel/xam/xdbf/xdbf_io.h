@@ -34,6 +34,8 @@ constexpr fourcc_t kXdbfSignatureXvc2 = make_fourcc("XVC2");
 constexpr fourcc_t kXdbfSignatureXmat = make_fourcc("XMAT");
 constexpr fourcc_t kXdbfSignatureXsrc = make_fourcc("XSRC");
 constexpr fourcc_t kXdbfSignatureXthd = make_fourcc("XTHD");
+constexpr fourcc_t kXdbfSignatureXrpt = make_fourcc("XRPT");
+constexpr fourcc_t kXdbfSignatureXpbm = make_fourcc("XPBM");
 
 constexpr uint64_t kXdbfIdTitle = 0x8000;
 constexpr uint64_t kXdbfIdXstc = 0x58535443;
@@ -44,6 +46,8 @@ constexpr uint64_t kXdbfIdXvc2 = 0x58564332;
 constexpr uint64_t kXdbfIdXmat = 0x584D4154;
 constexpr uint64_t kXdbfIdXsrc = 0x58535243;
 constexpr uint64_t kXdbfIdXthd = 0x58544844;
+constexpr uint64_t kXdbfIdXpbm = 0x5850424D;
+constexpr uint64_t kXdbfIdXrpt = 0x58525054;
 
 #pragma pack(push, 1)
 struct XdbfHeader {
@@ -163,8 +167,10 @@ struct Entry {
 // https://free60project.github.io/wiki/XDBF.html
 class XdbfFile {
  public:
-  XdbfFile() {};
+  XdbfFile() = default;
   XdbfFile(const std::span<const uint8_t> buffer);
+
+  ~XdbfFile() = default;
 
   const Entry* const GetEntry(uint16_t section, uint64_t id) const;
 
@@ -184,6 +190,42 @@ class XdbfFile {
   void LoadEntries(const XdbfEntry* table_of_content, const uint8_t* data_ptr);
   void LoadFreeEntries(const XdbfFileLoc* free_entries);
 };
+
+struct X_STRB_HEADER {
+  uint32_t magic;
+  bool blockAlignmentStored;
+  bool littleEndian;
+  uint8_t guid[0x10];
+  uint8_t blockIDSize;
+  uint8_t blockSpanSize;
+  uint16_t unused;
+  uint8_t blockAlignment;
+  int32_t blockHeaderSize;
+  uint32_t blockStartAddress;
+};
+static_assert_size(X_STRB_HEADER, 36);
+
+enum X_STRRB_BLOCK_ID : uint8_t {
+  STRBEof = 0xFF,  // -1
+  STRBInvalid = 0,
+  STRBAnimation = 1,
+  STRBTexture = 2,
+  STRBModel = 3,
+  STRBShapeOverrides = 4,
+  STRBSkeleton = 5,
+  STRBAssetMetadata = 6,
+  STRBCustomColorTable = 7,
+  STRBAssetMetadataVersioned = 8,
+};
+
+struct X_STRB_BLOCK {
+  X_STRRB_BLOCK_ID id;
+  int32_t data_length;
+  int32_t field_size;
+  uint32_t data_ptr;  // uint8_t*
+  uint32_t data_address;
+};
+static_assert_size(X_STRB_BLOCK, 20);
 
 }  // namespace xam
 }  // namespace kernel

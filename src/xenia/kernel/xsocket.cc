@@ -11,10 +11,10 @@
 
 #include <cstring>
 
+#include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_module.h"
-// #include "xenia/kernel/xnet.h"
 
 #ifdef XE_PLATFORM_WIN32
 // clang-format off
@@ -26,12 +26,36 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
 
 namespace xe {
 namespace kernel {
+
+// Translate socket options to native
+// Note:
+// SO_DONTLINGER = ~SO_LINGER
+// SO_EXCLUSIVEADDRUSE = ~SO_REUSEADDR
+// TODO: Check SO_DONTLINGER and SO_EXCLUSIVEADDRUSE usage on linux
+const std::map<uint32_t, uint32_t> supported_socket_options = {
+    {0x0004, SO_REUSEADDR}, {0x0020, SO_BROADCAST}, {0x0080, SO_LINGER},
+    {0x1001, SO_SNDBUF},    {0x1002, SO_RCVBUF},    {0x1005, SO_SNDTIMEO},
+    {0x1006, SO_RCVTIMEO},  {~0x0080, ~SO_LINGER},  {~0x0004, ~SO_REUSEADDR}};
+
+// Translate socket TCP options to native
+const std::map<uint32_t, uint32_t> supported_tcp_options = {
+    {0x0001, TCP_NODELAY}};
+
+// Translate socket levels to native
+const std::map<uint32_t, uint32_t> supported_levels = {{0xFFFF, SOL_SOCKET},
+                                                       {0x6, IPPROTO_TCP}};
+
+// Translate ioctl commands to native
+const std::map<uint32_t, uint32_t> supported_controls = {
+    {0x8004667E, FIONBIO}, {0x4004667F, FIONREAD}};
 
 XSocket::XSocket(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType) {}
@@ -46,9 +70,9 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
   type_ = type;
   proto_ = proto;
 
-  if (proto == Protocol::IPPROTO_VDP) {
+  if (proto == Protocol::XE_IPPROTO_VDP) {
     // VDP is a layer on top of UDP.
-    proto = Protocol::IPPROTO_UDP;
+    proto = Protocol::XE_IPPROTO_UDP;
   }
 
   native_handle_ = socket(af, type, proto);
@@ -62,7 +86,7 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 X_STATUS XSocket::Close() {
 #if XE_PLATFORM_WIN32
   int ret = closesocket(native_handle_);
-#elif XE_PLATFORM_LINUX
+#else
   int ret = close(native_handle_);
 #endif
 
@@ -92,10 +116,37 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_SUCCESS;
   }
 
-  int ret =
-      setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
+  int native_level = level;
+
+  assert_false(!supported_levels.contains(level));
+
+  if (supported_levels.contains(level)) {
+    native_level = supported_levels.at(level);
+  }
+
+  int native_optname = optname;
+
+  if (level == 0xFFFF) {
+    assert_false(!supported_socket_options.contains(optname));
+
+    if (supported_socket_options.contains(optname)) {
+      native_optname = supported_socket_options.at(optname);
+    }
+  }
+
+  if (level == IPPROTO_TCP) {
+    assert_false(!supported_tcp_options.contains(optname));
+
+    if (supported_tcp_options.contains(optname)) {
+      native_optname = supported_tcp_options.at(optname);
+    }
+  }
+
+  int ret = setsockopt(native_handle_, native_level, native_optname,
+                       static_cast<char*>(optval_ptr), optlen);
   if (ret < 0) {
     // TODO: WSAGetLastError()
+    XELOGE("XSocket::SetOption: failed with error {:08X}", GetLastWSAError());
     return X_STATUS_UNSUCCESSFUL;
   }
 
@@ -114,10 +165,23 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
     // TODO: Get last error
     return X_STATUS_UNSUCCESSFUL;
   }
+  return X_STATUS_SUCCESS;
+#else
+  int native_cmd = cmd;
+
+  assert_false(!supported_controls.contains(cmd));
+
+  if (supported_controls.contains(cmd)) {
+    native_cmd = supported_controls.at(cmd);
+  }
+
+  int ret = ioctl(native_handle_, native_cmd, arg_ptr);
+
+  if (ret < 0) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
 
   return X_STATUS_SUCCESS;
-#elif XE_PLATFORM_LINUX
-  return X_STATUS_UNSUCCESSFUL;
 #endif
 }
 
@@ -131,7 +195,20 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  // On Linux and Windows (when running under Wine), ports < 1024 require root
+  // privileges. Remap to port + 10000 to avoid privilege issues.
+  // Note: sin_port is xe::be<uint16_t> which automatically handles endianness,
+  // so we use it directly without ntohs/htons.
+  const uint16_t original_port = uint16_t(name->sin_port);
+  if (original_port < 1024) {
+    uint16_t new_port = original_port + 10000;
+    name->sin_port = new_port;
+    XELOGW("XSocket::Bind: port {} requires privileges, remapping to port {}",
+           original_port, new_port);
+  }
+
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
+
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
   }

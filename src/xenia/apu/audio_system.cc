@@ -50,9 +50,9 @@ AudioSystem::AudioSystem(cpu::Processor* processor)
       processor_(processor),
       worker_running_(false) {
   std::memset(clients_, 0, sizeof(clients_));
-  queued_frames_ = std::min(
-      static_cast<uint32_t>(kMaximumQueuedFrames),
-      std::max(cvars::apu_max_queued_frames, static_cast<uint32_t>(4)));
+  queued_frames_ = std::clamp(cvars::apu_max_queued_frames,
+                              static_cast<uint32_t>(kMinimumQueuedFrames),
+                              static_cast<uint32_t>(kMaximumQueuedFrames));
 
   for (size_t i = 0; i < kMaximumClientCount; ++i) {
     client_semaphores_[i] = xe::threading::Semaphore::Create(0, queued_frames_);
@@ -178,6 +178,25 @@ void AudioSystem::Shutdown() {
     worker_thread_->Wait(0, 0, 0, nullptr);
     worker_thread_.reset();
   }
+
+  // Unregister all active clients to shut down their audio drivers before
+  // the semaphores are destroyed with this AudioSystem.
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (size_t i = 0; i < kMaximumClientCount; ++i) {
+      if (clients_[i].in_use) {
+        DestroyDriver(clients_[i].driver);
+        if (clients_[i].wrapped_callback_arg) {
+          memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
+        }
+        clients_[i].driver = nullptr;
+        clients_[i].callback = 0;
+        clients_[i].callback_arg = 0;
+        clients_[i].wrapped_callback_arg = 0;
+        clients_[i].in_use = false;
+      }
+    }
+  }
 }
 
 X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
@@ -194,14 +213,21 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
   AudioDriver* driver;
   auto result = CreateDriver(index, client_semaphore, &driver);
   if (XFAILED(result)) {
+    XELOGE("AudioSystem::RegisterClient: CreateDriver failed for index={}",
+           index);
     return result;
   }
   assert_not_null(driver);
+  XELOGI(
+      "AudioSystem::RegisterClient: driver created for index={}, driver={:p}",
+      index, (void*)driver);
 
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
   xe::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
+  XELOGI("AudioSystem::RegisterClient: client {} registered successfully",
+         index);
 
   if (out_index) {
     *out_index = index;
@@ -215,7 +241,23 @@ void AudioSystem::SubmitFrame(size_t index, float* samples) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
-  assert_true(clients_[index].driver != NULL);
+  if (index >= kMaximumClientCount || !clients_[index].in_use ||
+      !clients_[index].driver) {
+    XELOGW(
+        "SubmitFrame called for invalid/unregistered client index {} "
+        "(in_use={}, driver={:p})",
+        index, index < kMaximumClientCount ? clients_[index].in_use : false,
+        index < kMaximumClientCount ? (void*)clients_[index].driver : nullptr);
+
+    // Submit silence instead of dropping the frame to maintain the callback
+    // chain.  If we don't submit anything, the audio driver's OnBufferEnd
+    // callback will never fire, causing the semaphore to leak.
+    if (index < kMaximumClientCount && clients_[index].driver) {
+      static float silence[apu::AudioDriver::kFrameSamplesMax] = {0};
+      (clients_[index].driver)->SubmitFrame(silence);
+    }
+    return;
+  }
   (clients_[index].driver)->SubmitFrame(samples);
 }
 

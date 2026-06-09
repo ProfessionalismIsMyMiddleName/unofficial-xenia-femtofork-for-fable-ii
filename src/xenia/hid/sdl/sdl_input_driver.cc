@@ -9,8 +9,6 @@
 
 #include "xenia/hid/sdl/sdl_input_driver.h"
 
-#include <array>
-
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
 #endif  // XE_PLATFORM_WIN32
@@ -221,32 +219,18 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index,
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  auto is_active = this->is_active();
-
-  if (is_active) {
-    QueueControllerUpdate();
-  }
+  QueueControllerUpdate();
 
   auto controller = GetControllerState(user_index);
   if (!controller) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // Make sure packet_number is only incremented by 1, even if there have been
-  // multiple updates between GetState calls. Also track `is_active` to
-  // increment the packet number if it changed.
-  if ((is_active != controller->is_active) ||
-      (is_active && controller->state_changed)) {
+  if (controller->state_changed) {
     controller->state.packet_number++;
-    controller->is_active = is_active;
     controller->state_changed = false;
   }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
-  if (!is_active) {
-    // Simulate an "untouched" controller. When we become active again the
-    // pressed buttons aren't lost and will be visible again.
-    std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
-  }
   return X_ERROR_SUCCESS;
 }
 
@@ -334,11 +318,7 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
       ui::VirtualKey::kXInputPadRThumbDownLeft,
   };
 
-  auto is_active = this->is_active();
-
-  if (is_active) {
-    QueueControllerUpdate();
-  }
+  QueueControllerUpdate();
 
   for (uint32_t user_index = (user_any ? 0 : users);
        user_index < (user_any ? HID_SDL_USER_COUNT : users + 1); user_index++) {
@@ -354,10 +334,8 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
     // If input is not active (e.g. due to a dialog overlay), force buttons to
     // "unpressed". The algorithm will automatically send UP events when
     // `is_active()` goes low and DOWN events when it goes high again.
-    const uint64_t curr_butts =
-        is_active ? (controller->state.gamepad.buttons |
-                     AnalogToKeyfield(controller->state.gamepad))
-                  : uint64_t(0);
+    const uint64_t curr_butts = controller->state.gamepad.buttons |
+                                AnalogToKeyfield(controller->state.gamepad);
     KeystrokeState& last = keystroke_states_.at(user_index);
 
     // Handle repeating

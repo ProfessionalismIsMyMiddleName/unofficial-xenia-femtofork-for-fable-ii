@@ -56,6 +56,15 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
   auto global_lock = global_critical_region_.Acquire();
+  auto it = std::find_if(
+      symlinks_.cbegin(), symlinks_.cend(),
+      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+  if (it != symlinks_.end()) {
+    XELOGE("Trying to re-register already registered symbolic link: {} => {}",
+           path, target);
+    return false;
+  }
+
   symlinks_.insert({std::string(path), std::string(target)});
   XELOGD("Registered symbolic link: {} => {}", path, target);
 
@@ -74,6 +83,14 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
 
   symlinks_.erase(it);
   return true;
+}
+
+bool VirtualFileSystem::IsSymbolicLinkRegistered(const std::string_view path) {
+  auto it = std::find_if(
+      symlinks_.cbegin(), symlinks_.cend(),
+      [&](const auto& s) { return xe::utf8::equal_case(path, s.first); });
+
+  return it != symlinks_.cend();
 }
 
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path,
@@ -213,7 +230,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
                                : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
       *out_action = FileAction::kDoesNotExist;
-      return X_STATUS_NO_SUCH_FILE;
+      return X_STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
     auto file_name = xe::utf8::find_name_from_guest_path(path);
@@ -229,11 +246,11 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
 
     // If the entry does not exist on the host then remove the cached entry
     if (parent_entry) {
-      const xe::vfs::HostPathEntry* host_Path =
+      const xe::vfs::HostPathEntry* host_path =
           dynamic_cast<const xe::vfs::HostPathEntry*>(parent_entry);
 
-      if (host_Path) {
-        auto const file_path = host_Path->host_path() / entry->name();
+      if (host_path) {
+        auto const file_path = host_path->host_path() / entry->name();
 
         if (!std::filesystem::exists(file_path)) {
           // Remove cached entry
@@ -251,7 +268,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       // Must exist.
       if (!entry) {
         *out_action = FileAction::kDoesNotExist;
-        return X_STATUS_NO_SUCH_FILE;
+        return X_STATUS_OBJECT_NAME_NOT_FOUND;
       }
       break;
     case FileDisposition::kCreate:
@@ -375,23 +392,26 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
   if (entry->can_map()) {
     auto map = entry->OpenMapped(xe::MappedMemory::Mode::kRead);
 
-    auto remaining_size = map->size();
-    auto offset = 0;
+    size_t remaining_size = map->size();
+    size_t offset = 0;
 
     while (remaining_size > 0) {
-      fwrite(map->data() + offset, write_buffer_size, 1, file);
-      offset += write_buffer_size;
-      remaining_size -= write_buffer_size;
+      const auto bytes_to_read = std::min(write_buffer_size, remaining_size);
+      fwrite(map->data() + offset, bytes_to_read, 1, file);
+      offset += bytes_to_read;
+      remaining_size -= bytes_to_read;
+      progress += bytes_to_read;
     }
     map->Close();
   } else {
-    auto remaining_size = entry->size();
+    size_t remaining_size = entry->size();
     size_t offset = 0;
     buffer = new uint8_t[write_buffer_size];
 
     while (remaining_size > 0) {
       size_t bytes_read = 0;
-      in_file->ReadSync(buffer, write_buffer_size, offset, &bytes_read);
+      in_file->ReadSync(std::span<uint8_t>(buffer, write_buffer_size), offset,
+                        &bytes_read);
       fwrite(buffer, bytes_read, 1, file);
       offset += bytes_read;
       remaining_size -= bytes_read;

@@ -9,10 +9,7 @@
 
 #include "xenia/gpu/d3d12/d3d12_primitive_processor.h"
 
-#include <algorithm>
 #include <cstdint>
-#include <memory>
-#include <utility>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
@@ -100,7 +97,7 @@ bool D3D12PrimitiveProcessor::InitializeBuiltinIndexBuffer(
   if (FAILED(device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesDefault,
           provider.GetHeapFlagCreateNotZeroed(), &resource_desc,
-          D3D12_RESOURCE_STATE_COMMON, nullptr,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
           IID_PPV_ARGS(&draw_resource)))) {
     XELOGE(
         "D3D12 primitive processor: Failed to create the built-in index "

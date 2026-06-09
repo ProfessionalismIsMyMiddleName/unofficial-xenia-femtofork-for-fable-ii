@@ -19,11 +19,12 @@
 #include <vector>
 
 #include "xenia/base/assert.h"
-#include "xenia/base/platform.h"
 #include "xenia/ui/presenter.h"
 #include "xenia/ui/surface.h"
-#include "xenia/ui/vulkan/vulkan_provider.h"
-#include "xenia/ui/vulkan/vulkan_submission_tracker.h"
+#include "xenia/ui/vulkan/ui_samplers.h"
+#include "xenia/ui/vulkan/vulkan_device.h"
+#include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
+#include "xenia/ui/vulkan/vulkan_instance.h"
 
 namespace xe {
 namespace ui {
@@ -90,7 +91,7 @@ class VulkanPresenter final : public Presenter {
   static constexpr VkImageLayout kGuestOutputInternalLayout =
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-  // The callback must use the graphics and compute queue 0 of the provider.
+  // The callback must use the graphics and compute queue 0 of the device.
   class VulkanGuestOutputRefreshContext final
       : public GuestOutputRefreshContext {
    public:
@@ -123,9 +124,10 @@ class VulkanPresenter final : public Presenter {
   };
 
   static std::unique_ptr<VulkanPresenter> Create(
-      HostGpuLossCallback host_gpu_loss_callback, VulkanProvider& provider) {
-    auto presenter = std::unique_ptr<VulkanPresenter>(
-        new VulkanPresenter(host_gpu_loss_callback, provider));
+      HostGpuLossCallback host_gpu_loss_callback, VulkanDevice* vulkan_device,
+      const UISamplers* ui_samplers) {
+    auto presenter = std::unique_ptr<VulkanPresenter>(new VulkanPresenter(
+        host_gpu_loss_callback, vulkan_device, ui_samplers));
     if (!presenter->InitializeSurfaceIndependent()) {
       return nullptr;
     }
@@ -134,35 +136,16 @@ class VulkanPresenter final : public Presenter {
 
   ~VulkanPresenter();
 
-  VulkanProvider& provider() const { return provider_; }
+  VulkanDevice* vulkan_device() const { return vulkan_device_; }
 
   static Surface::TypeFlags GetSurfaceTypesSupportedByInstance(
-      const VulkanProvider::InstanceExtensions& instance_extensions) {
-    if (!instance_extensions.khr_surface) {
-      return 0;
-    }
-    Surface::TypeFlags type_flags = 0;
-#if XE_PLATFORM_ANDROID
-    if (instance_extensions.khr_android_surface) {
-      type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
-    }
-#elif XE_PLATFORM_GNU_LINUX
-    if (instance_extensions.khr_xcb_surface) {
-      type_flags |= Surface::kTypeFlag_XcbWindow;
-    }
-#elif XE_PLATFORM_WIN32
-    if (instance_extensions.khr_win32_surface) {
-      type_flags |= Surface::kTypeFlag_Win32Hwnd;
-    }
-#endif
-    return type_flags;
-  }
+      const VulkanInstance::Extensions& instance_extensions);
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
-    ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
+    ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
   }
   VkCommandBuffer AcquireUISetupCommandBufferFromUIThread();
 
@@ -186,11 +169,12 @@ class VulkanPresenter final : public Presenter {
   class GuestOutputImage {
    public:
     static std::unique_ptr<GuestOutputImage> Create(
-        const VulkanProvider& provider, uint32_t width, uint32_t height) {
+        const VulkanDevice* const vulkan_device, const uint32_t width,
+        const uint32_t height) {
       assert_not_zero(width);
       assert_not_zero(height);
       auto image = std::unique_ptr<GuestOutputImage>(
-          new GuestOutputImage(provider, width, height));
+          new GuestOutputImage(vulkan_device, width, height));
       if (!image->Initialize()) {
         return nullptr;
       }
@@ -208,16 +192,16 @@ class VulkanPresenter final : public Presenter {
     VkImageView view() const { return view_; }
 
    private:
-    GuestOutputImage(const VulkanProvider& provider, uint32_t width,
-                     uint32_t height)
-        : provider_(provider) {
+    GuestOutputImage(const VulkanDevice* const vulkan_device,
+                     const uint32_t width, const uint32_t height)
+        : vulkan_device_(vulkan_device) {
       extent_.width = width;
       extent_.height = height;
     }
 
     bool Initialize();
 
-    const VulkanProvider& provider_;
+    const VulkanDevice* vulkan_device_;
 
     VkExtent2D extent_;
     VkImage image_ = VK_NULL_HANDLE;
@@ -299,8 +283,9 @@ class VulkanPresenter final : public Presenter {
     class Submission {
      public:
       static std::unique_ptr<Submission> Create(
-          const VulkanProvider& provider) {
-        auto submission = std::unique_ptr<Submission>(new Submission(provider));
+          const VulkanDevice* const vulkan_device) {
+        auto submission =
+            std::unique_ptr<Submission>(new Submission(vulkan_device));
         if (!submission->Initialize()) {
           return nullptr;
         }
@@ -312,20 +297,18 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const {
         return draw_command_buffer_;
       }
 
      private:
-      explicit Submission(const VulkanProvider& provider)
-          : provider_(provider) {}
+      explicit Submission(const VulkanDevice* const vulkan_device)
+          : vulkan_device_(vulkan_device) {}
       bool Initialize();
 
-      const VulkanProvider& provider_;
+      const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -376,8 +359,8 @@ class VulkanPresenter final : public Presenter {
       VkFramebuffer framebuffer;
     };
 
-    explicit PaintContext(VulkanProvider& provider)
-        : provider(provider), submission_tracker(provider) {}
+    explicit PaintContext(VulkanDevice* const vulkan_device)
+        : vulkan_device(vulkan_device), completion_timeline(vulkan_device) {}
     PaintContext(const PaintContext& paint_context) = delete;
     PaintContext& operator=(const PaintContext& paint_context) = delete;
 
@@ -386,7 +369,7 @@ class VulkanPresenter final : public Presenter {
     // technically retire it, so it will be in an undefined state), and needs to
     // be destroyed externally no matter what the result is.
     static VkSwapchainKHR CreateSwapchainForVulkanSurface(
-        const VulkanProvider& provider, VkSurfaceKHR surface, uint32_t width,
+        const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width,
         uint32_t height, VkSwapchainKHR old_swapchain,
         uint32_t& present_queue_family_out, VkFormat& image_format_out,
         VkExtent2D& image_extent_out, bool& is_fifo_out,
@@ -401,11 +384,11 @@ class VulkanPresenter final : public Presenter {
 
     // Connection-indepedent.
 
-    const VulkanProvider& provider;
+    VulkanDevice* vulkan_device;
 
     std::array<std::unique_ptr<PaintContext::Submission>, kSubmissionCount>
         submissions;
-    VulkanSubmissionTracker submission_tracker;
+    VulkanGPUCompletionTimeline completion_timeline;
 
     std::array<GuestOutputPaintPipeline, size_t(GuestOutputPaintEffect::kCount)>
         guest_output_paint_pipelines;
@@ -457,22 +440,29 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_is_fifo = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+    std::vector<VkSemaphore> swapchain_image_present_semaphores;
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
-                           VulkanProvider& provider)
+                           VulkanDevice* vulkan_device,
+                           const UISamplers* ui_samplers)
       : Presenter(host_gpu_loss_callback),
-        provider_(provider),
-        guest_output_image_refresher_submission_tracker_(provider),
-        ui_submission_tracker_(provider),
-        paint_context_(provider) {}
+        vulkan_device_(vulkan_device),
+        ui_samplers_(ui_samplers),
+        guest_output_image_refresher_completion_timeline_(vulkan_device),
+        ui_completion_timeline_(vulkan_device),
+        paint_context_(vulkan_device) {
+    assert_not_null(vulkan_device);
+    assert_not_null(ui_samplers);
+  }
 
   bool InitializeSurfaceIndependent();
 
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(
       GuestOutputPaintEffect effect, VkRenderPass render_pass);
 
-  VulkanProvider& provider_;
+  VulkanDevice* vulkan_device_;
+  const UISamplers* ui_samplers_;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage
@@ -498,11 +488,11 @@ class VulkanPresenter final : public Presenter {
   uint64_t guest_output_image_next_version_ = 0;
   std::array<GuestOutputImageInstance, kGuestOutputMailboxSize>
       guest_output_images_;
-  VulkanSubmissionTracker guest_output_image_refresher_submission_tracker_;
+  VulkanGPUCompletionTimeline guest_output_image_refresher_completion_timeline_;
 
-  // UI submission tracker with the submission index that can be given to UI
-  // drawers (accessible from the UI thread only, at any time).
-  VulkanSubmissionTracker ui_submission_tracker_;
+  // UI submission completion timeline with the submission index that can be
+  // given to UI drawers (accessible from the UI thread only, at any time).
+  VulkanGPUCompletionTimeline ui_completion_timeline_;
 
   // Accessible only by painting and by surface connection lifetime management
   // (ConnectOrReconnectPaintingToSurfaceFromUIThread,

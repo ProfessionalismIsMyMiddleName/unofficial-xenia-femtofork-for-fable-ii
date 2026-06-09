@@ -39,10 +39,17 @@ namespace xe {
 namespace kernel {
 namespace xam {
 
-const static std::string kDashboardStringID =
+inline const std::string kDashboardStringID =
     fmt::format("{:08X}", kDashboardID);
 
 constexpr std::string_view kDefaultMountFormat = "User_{:016X}";
+
+const static inline uint64_t GenerateXuid() {
+  std::random_device rd;
+  std::mt19937 gen(rd());
+
+  return ((uint64_t)0xE03 << 52) + (gen() % (1 << 31));
+}
 
 class ProfileManager {
  public:
@@ -60,14 +67,13 @@ class ProfileManager {
   // Loading Account means load basic data
   ProfileManager(KernelState* kernel_state, UserTracker* user_tracker);
 
-  ~ProfileManager();
+  ~ProfileManager() = default;
 
   bool CreateProfile(const std::string gamertag, bool autologin,
                      bool default_xuid = false);
-  // bool CreateProfile(const X_XAMACCOUNTINFO* account_info);
-  bool DeleteProfile(const uint64_t xuid);
+  bool CreateProfile(const X_XAMACCOUNTINFO* account_info, uint64_t xuid);
 
-  void ModifyGamertag(const uint64_t xuid, std::string gamertag);
+  bool DeleteProfile(const uint64_t xuid);
 
   bool MountProfile(const uint64_t xuid, std::string mount_path = "");
   bool DismountProfile(const uint64_t xuid);
@@ -78,9 +84,9 @@ class ProfileManager {
   void LoginMultiple(const std::map<uint8_t, uint64_t>& profiles);
 
   bool LoadAccount(const uint64_t xuid);
-  void LoadAccounts(const std::vector<uint64_t> profiles_xuids);
 
   void ReloadProfiles();
+  void ReloadProfile(const uint64_t xuid);
 
   UserProfile* GetProfile(const uint64_t xuid) const;
   UserProfile* GetProfile(const uint8_t user_index) const;
@@ -100,12 +106,14 @@ class ProfileManager {
       const uint64_t xuid, const uint32_t title_id = -1,
       const XContentType content_type = XContentType::kInvalid) const;
 
+  bool UpdateAccount(const uint64_t xuid, const X_XAMACCOUNTINFO* account);
+
   static bool IsGamertagValid(const std::string gamertag);
 
  private:
   void UpdateConfig(const uint64_t xuid, const uint8_t slot);
   bool CreateAccount(const uint64_t xuid, const std::string gamertag);
-  bool UpdateAccount(const uint64_t xuid, X_XAMACCOUNTINFO* account);
+  bool CreateAccount(const uint64_t xuid, const X_XAMACCOUNTINFO* account);
 
   std::filesystem::path GetProfilePath(const uint64_t xuid) const;
   std::filesystem::path GetProfilePath(const std::string xuid) const;
@@ -114,13 +122,6 @@ class ProfileManager {
 
   uint8_t FindFirstFreeProfileSlot() const;
   std::bitset<XUserMaxUserCount> GetUsedUserSlots() const;
-
-  uint64_t GenerateXuid() const {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-
-    return ((uint64_t)0xE03 << 52) + (gen() % (1 << 31));
-  }
 
   std::map<uint64_t, X_XAMACCOUNTINFO> accounts_;
   std::map<uint8_t, std::unique_ptr<UserProfile>> logged_profiles_;

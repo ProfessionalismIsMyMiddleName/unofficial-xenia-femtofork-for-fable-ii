@@ -171,7 +171,7 @@ std::vector<std::unique_ptr<hid::InputDriver>> HidDemoApp::CreateInputDrivers(
 
 bool HidDemoApp::OnInitialize() {
   // Create the graphics provider that provides the presenter for the window.
-  graphics_provider_ = xe::ui::vulkan::VulkanProvider::Create(true);
+  graphics_provider_ = xe::ui::vulkan::VulkanProvider::Create(false, true);
   if (!graphics_provider_) {
     XELOGE("Failed to initialize the graphics provider");
     return false;
@@ -467,7 +467,9 @@ void HidDemoApp::DrawInputGetKeystroke(bool poll, bool hide_repeats,
   for (uint32_t user_index = 0; user_index < MAX_USERS; ++user_index) {
     DrawUserInputGetKeystroke(user_index, poll, hide_repeats, clear_log);
   }
-  if (tab_bar) ImGui::EndTabBar();
+  if (tab_bar) {
+    ImGui::EndTabBar();
+  }
 }
 
 }  // namespace hid

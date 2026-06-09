@@ -18,7 +18,6 @@
 #include "xenia/gpu/shared_memory.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/memory.h"
-#include "xenia/ui/vulkan/vulkan_provider.h"
 #include "xenia/ui/vulkan/vulkan_upload_buffer_pool.h"
 
 namespace xe {
@@ -36,6 +35,7 @@ class VulkanSharedMemory : public SharedMemory {
 
   bool Initialize();
   void Shutdown(bool from_destructor = false);
+  void ClearCache() override;
 
   void CompletedSubmissionUpdated();
   void EndSubmission();

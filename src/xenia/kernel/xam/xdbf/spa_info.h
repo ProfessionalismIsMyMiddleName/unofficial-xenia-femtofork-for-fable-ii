@@ -14,6 +14,8 @@
 
 #include <map>
 #include <numeric>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,8 @@ enum class TitleType : uint32_t {
   kFull = 1,
   kDemo = 2,
   kDownload = 3,
+  kUnknown = 4,
+  kApp = 5
 };
 
 enum class TitleFlags {
@@ -45,7 +49,122 @@ enum class TitleFlags {
   kNeverIncludeInProfile = 2,
 };
 
+constexpr uint32_t kViewTypeMask = 0xF;
+
+enum class ViewType : uint32_t {
+  kLeaderboard = 0,
+  kContextByProperty = 1,
+  kContextByContext = 2
+};
+
+enum class StatsViewFlags : uint16_t {
+  kArbitrated = 16,
+  kHidden = 32,
+  kTeamView = 64,
+  kOnlineOnly = 128,
+};
+
+enum class AggregationType : uint16_t {
+  kLast = 0x8001,
+  kMax = 0x800B,
+  kSum = 0x8003,
+  kMin = 0x8009,
+};
+
+enum class ViewFieldEntryFlags : uint32_t {
+  kHidden = 1,
+};
+
+enum class ViewFieldType : uint8_t { kContextField, kPropertyField };
+
+constexpr inline std::string GetAggregationTypeName(
+    const uint32_t aggregation_type) {
+  switch (static_cast<AggregationType>(aggregation_type)) {
+    case AggregationType::kLast:
+      return "Last";
+    case AggregationType::kMax:
+      return "Max";
+    case AggregationType::kSum:
+      return "Sum";
+    case AggregationType::kMin:
+      return "Min";
+    default:
+      return "";
+  }
+}
+
+constexpr inline std::string GetViewTypeName(const uint32_t view_type) {
+  switch (static_cast<ViewType>(view_type)) {
+    case ViewType::kLeaderboard:
+      return "Leaderboard";
+    case ViewType::kContextByProperty:
+      return "Context by Property";
+    case ViewType::kContextByContext:
+      return "Context by Context";
+    default:
+      return "";
+  }
+}
+constexpr inline std::string AttributeIdToName(const uint16_t id) {
+  switch (id) {
+    case std::numeric_limits<uint16_t>::max():
+      return "Rank";
+    case 65534:
+      return "Rating";
+    case 65533:
+      return "Gamertag";
+    case 65530:
+      return "Attachment Size";
+    default:
+      return "";
+  }
+}
+
+constexpr inline std::string GetViewTypeName(const ViewType view_type) {
+  return GetViewTypeName(static_cast<uint32_t>(view_type));
+}
+
+constexpr inline ViewType GetViewType(const uint32_t flags) {
+  return static_cast<ViewType>(flags & kViewTypeMask);
+}
+
+constexpr inline bool IsArbitrated(const uint32_t flags) {
+  return flags & static_cast<uint32_t>(StatsViewFlags::kArbitrated);
+}
+
+constexpr inline bool IsHidden(const uint32_t flags) {
+  return flags & static_cast<uint32_t>(StatsViewFlags::kHidden);
+}
+
+constexpr inline bool IsTeamView(const uint32_t flags) {
+  return flags & static_cast<uint32_t>(StatsViewFlags::kTeamView);
+}
+
+constexpr inline bool IsOnlineOnly(const uint32_t flags) {
+  return flags & static_cast<uint32_t>(StatsViewFlags::kOnlineOnly);
+}
+
+constexpr inline uint32_t GetSkillLeaderboardId(uint32_t game_type,
+                                                uint32_t game_mode) {
+  return (0xFFF00000 | (game_type == 1 ? 0xF0000 : 0xE0000)) |
+         (game_mode & 0xFFFF);
+}
+
+constexpr inline bool IsLeaderboardIdSkill(uint32_t id) {
+  return (id & 0x2000000) != 0;
+}
+
 #pragma pack(push, 1)
+struct PropertyBagEntry {
+  xe::be<uint32_t> contexts_count;
+  xe::be<uint32_t> properties_count;
+};
+
+struct PropertyBag {
+  std::set<xe::be<uint32_t>> contexts;
+  std::set<xe::be<uint32_t>> properties;
+};
+
 struct TitleHeaderData {
   xe::be<uint32_t> title_id;
   xe::be<TitleType> title_type;
@@ -62,7 +181,7 @@ static_assert_size(TitleHeaderData, 32);
 
 struct StatsViewTableEntry {
   xe::be<uint32_t> id;
-  xe::be<uint32_t> flags;
+  xe::be<uint32_t> flags;  // StatsViewFlags
   xe::be<uint16_t> shared_index;
   xe::be<uint16_t> string_id;
   xe::be<uint32_t> unused;
@@ -72,10 +191,10 @@ static_assert_size(StatsViewTableEntry, 0x10);
 struct ViewFieldEntry {
   xe::be<uint32_t> size;
   xe::be<uint32_t> property_id;
-  xe::be<uint32_t> flags;
+  xe::be<uint32_t> flags;  // ViewFieldEntryFlags
   xe::be<uint16_t> attribute_id;
   xe::be<uint16_t> string_id;
-  xe::be<uint16_t> aggregation_type;
+  xe::be<uint16_t> aggregation_type;  // AggregationType
   xe::be<uint8_t> ordinal;
   xe::be<uint8_t> field_type;
   xe::be<uint32_t> format_type;
@@ -92,11 +211,6 @@ struct SharedViewMetaTableEntry {
 };
 static_assert_size(SharedViewMetaTableEntry, 0xC);
 
-struct PropertyBag {
-  std::vector<xe::be<uint32_t>> contexts;
-  std::vector<xe::be<uint32_t>> properties;
-};
-
 struct SharedView {
   std::vector<ViewFieldEntry> column_entries;
   std::vector<ViewFieldEntry> row_entries;
@@ -106,6 +220,11 @@ struct SharedView {
 struct ViewTable {
   StatsViewTableEntry view_entry;
   SharedView shared_view;
+};
+
+struct PresenceTableEntry {
+  PropertyBag property_bag;
+  std::vector<PropertyBag> presence_modes;
 };
 
 struct AchievementTableEntry {
@@ -128,6 +247,7 @@ static_assert_size(AchievementTableEntry, 0x24);
 class SpaInfo : public XdbfFile {
  public:
   SpaInfo(const std::span<uint8_t> buffer);
+  ~SpaInfo() = default;
 
   void Load();
 
@@ -173,8 +293,17 @@ class SpaInfo : public XdbfFile {
     return properties_;
   }
 
+  const std::vector<ViewTable>* GetStatsViews() const { return &stats_views_; }
+
+  const PresenceTableEntry* GetPresence() const { return &presence_; }
+
+  const PropertyBag* GetMatchCollection() const { return &matchmaking_; }
+
   const XdbfContextTableEntry* GetContext(uint32_t id);
   const XdbfPropertyTableEntry* GetProperty(uint32_t id);
+  const std::optional<ViewTable> GetStatsView(uint32_t id);
+  const std::optional<PropertyBag> GetPresenceMode(
+      uint32_t context_value) const;
 
   uint32_t total_gamerscore() const {
     return std::accumulate(achievements_.cbegin(), achievements_.cend(), 0,
@@ -199,8 +328,11 @@ class SpaInfo : public XdbfFile {
   std::vector<const AchievementTableEntry*> achievements_;
   std::vector<const XdbfContextTableEntry*> contexts_;
   std::vector<const XdbfPropertyTableEntry*> properties_;
+  std::vector<ViewTable> stats_views_;
+  PresenceTableEntry presence_;
+  PropertyBag matchmaking_;
 
-  typedef std::map<uint16_t, std::string> XdbfLanguageStrings;
+  using XdbfLanguageStrings = std::map<uint16_t, std::string>;
 
   std::map<XLanguage, XdbfLanguageStrings> language_strings_;
 
@@ -211,6 +343,10 @@ class SpaInfo : public XdbfFile {
 
   void LoadContexts();
   void LoadProperties();
+
+  void LoadStatsViews();
+  void LoadPresenceModes();
+  void LoadMatchmaking();
 
   template <typename T>
   static T GetSpaEntry(std::vector<T>& container, uint32_t id);

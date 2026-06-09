@@ -9,7 +9,10 @@
 
 #include "xenia/base/cvar.h"
 #include <iostream>
-#define UTF_CPP_CPLUSPLUS 202002L
+// https://github.com/nemtrif/utfcpp/issues/85
+#if defined(_MSVC_LANG) && _MSVC_LANG > __cplusplus
+#define UTF_CPP_CPLUSPLUS _MSVC_LANG
+#endif
 #include "third_party/utfcpp/source/utf8.h"
 
 #include "xenia/base/console.h"
@@ -27,6 +30,7 @@ cxxopts::Options options("xenia", "Xbox 360 Emulator");
 std::map<std::string, ICommandVar*>* CmdVars;
 std::map<std::string, IConfigVar*>* ConfigVars;
 std::multimap<uint32_t, const IConfigVarUpdate*>* IConfigVarUpdate::updates_;
+std::vector<std::string>* config_type_mismatch_warnings = nullptr;
 
 void PrintHelpAndExit() {
   std::cout << options.help({""}) << std::endl;

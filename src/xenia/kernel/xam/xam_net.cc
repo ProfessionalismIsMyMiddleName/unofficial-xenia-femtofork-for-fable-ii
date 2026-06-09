@@ -7,9 +7,6 @@
  ******************************************************************************
  */
 
-#include <cstring>
-
-#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -26,10 +23,11 @@
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
-#elif XE_PLATFORM_LINUX
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #endif
 
@@ -57,13 +55,14 @@ typedef struct {
   uint8_t abOnline[20];          // Online identification
 } XNADDR;
 
-typedef struct {
+struct XNDNS {
   xe::be<int32_t> status;
   xe::be<uint32_t> cina;
   in_addr aina[8];
-} XNDNS;
+};
+static_assert_size(XNDNS, 0x28);
 
-typedef struct {
+struct XNQOSINFO {
   uint8_t flags;
   uint8_t reserved;
   xe::be<uint16_t> probes_xmit;
@@ -74,18 +73,20 @@ typedef struct {
   xe::be<uint16_t> rtt_med_in_msecs;
   xe::be<uint32_t> up_bits_per_sec;
   xe::be<uint32_t> down_bits_per_sec;
-} XNQOSINFO;
+};
+static_assert_size(XNQOSINFO, 0x18);
 
-typedef struct {
+struct XNQOS {
   xe::be<uint32_t> count;
   xe::be<uint32_t> count_pending;
   XNQOSINFO info[1];
-} XNQOS;
+};
 
 struct Xsockaddr_t {
   xe::be<uint16_t> sa_family;
   char sa_data[14];
 };
+static_assert_size(XNQOS, 0x20);
 
 struct X_WSADATA {
   xe::be<uint16_t> version;
@@ -96,6 +97,7 @@ struct X_WSADATA {
   xe::be<uint16_t> max_udpdg;
   xe::be<uint32_t> vendor_info_ptr;
 };
+static_assert_size(X_WSADATA, 0x190);
 
 struct XWSABUF {
   xe::be<uint32_t> len;
@@ -166,6 +168,7 @@ struct XNetStartupParams {
   uint8_t cfgQosSrvMaxSimultaneousResponses;
   uint8_t cfgQosPairWaitTimeInSeconds;
 };
+static_assert_size(XNetStartupParams, 0xD);
 
 XNetStartupParams xnet_startup_params = {0};
 
@@ -236,48 +239,46 @@ DECLARE_XAM_EXPORT1(NetDll_XNetGetOpt, kNetworking, kSketchy);
 
 dword_result_t NetDll_XNetRandom_entry(dword_t caller, lpvoid_t buffer_ptr,
                                        dword_t length) {
-  // For now, constant values.
-  // This makes replicating things easier.
-  std::memset(buffer_ptr, 0xBB, length);
+  uint8_t* buffer_data_ptr = buffer_ptr.as<uint8_t*>();
 
-  return 0;
+  if (buffer_data_ptr == nullptr || length == 0) {
+    return X_ERROR_SUCCESS;
+  }
+
+  std::random_device rnd;
+  std::mt19937_64 gen(rnd());
+  std::uniform_int_distribution<int> dist(0,
+                                          std::numeric_limits<uint8_t>::max());
+
+  std::generate(buffer_data_ptr, buffer_data_ptr + length,
+                [&]() { return static_cast<uint8_t>(dist(gen)); });
+
+  return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(NetDll_XNetRandom, kNetworking, kStub);
+DECLARE_XAM_EXPORT1(NetDll_XNetRandom, kNetworking, kImplemented);
 
 dword_result_t NetDll_WSAStartup_entry(dword_t caller, word_t version,
                                        pointer_t<X_WSADATA> data_ptr) {
-// TODO(benvanik): abstraction layer needed.
-#ifdef XE_PLATFORM_WIN32
-  WSADATA wsaData;
-  ZeroMemory(&wsaData, sizeof(WSADATA));
-  int ret = WSAStartup(version, &wsaData);
+  // TODO(benvanik): abstraction layer needed.
+  int ret = 0;
 
-  auto data_out = kernel_state()->memory()->TranslateVirtual(data_ptr);
+#ifdef XE_PLATFORM_WIN32
+  WSADATA wsaData = {};
+
+  ret = WSAStartup(version, &wsaData);
+#endif
 
   if (data_ptr) {
+    data_ptr.Zero();
+
+#ifdef XE_PLATFORM_WIN32
     data_ptr->version = wsaData.wVersion;
     data_ptr->version_high = wsaData.wHighVersion;
-    std::memcpy(&data_ptr->description, wsaData.szDescription, 0x100);
-    std::memcpy(&data_ptr->system_status, wsaData.szSystemStatus, 0x80);
-    data_ptr->max_sockets = wsaData.iMaxSockets;
-    data_ptr->max_udpdg = wsaData.iMaxUdpDg;
-
-    // Some games (5841099F) want this value round-tripped - they'll compare if
-    // it changes and bugcheck if it does.
-    uint32_t vendor_ptr = xe::load_and_swap<uint32_t>(data_out + 0x190);
-    xe::store_and_swap<uint32_t>(data_out + 0x190, vendor_ptr);
-  }
 #else
-  int ret = 0;
-  if (data_ptr) {
-    // Guess these values!
     data_ptr->version = version.value();
-    data_ptr->description[0] = '\0';
-    data_ptr->system_status[0] = '\0';
-    data_ptr->max_sockets = 100;
-    data_ptr->max_udpdg = 1024;
-  }
+    data_ptr->version_high = 0x0202;
 #endif
+  }
 
   // DEBUG
   /*
@@ -657,6 +658,8 @@ dword_result_t NetDll_socket_entry(dword_t caller, dword_t af, dword_t type,
     socket->Release();
 
     XThread::SetLastError(socket->GetLastWSAError());
+    XELOGE("NetDll_socket: failed with error {:08X}",
+           socket->GetLastWSAError());
     return -1;
   }
 
@@ -740,6 +743,8 @@ dword_result_t NetDll_ioctlsocket_entry(dword_t caller, dword_t socket_handle,
   X_STATUS status = socket->IOControl(cmd, arg_ptr);
   if (XFAILED(status)) {
     XThread::SetLastError(socket->GetLastWSAError());
+    XELOGE("NetDll_ioctlsocket: failed with error {:08X}",
+           socket->GetLastWSAError());
     return -1;
   }
 
@@ -762,6 +767,7 @@ dword_result_t NetDll_bind_entry(dword_t caller, dword_t socket_handle,
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(socket->GetLastWSAError());
+    XELOGE("NetDll_bind: failed with error {:08X}", socket->GetLastWSAError());
     return -1;
   }
 
@@ -1025,7 +1031,8 @@ dword_result_t NetDll_sendto_entry(dword_t caller, dword_t socket_handle,
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  return ret;
 }
 DECLARE_XAM_EXPORT1(NetDll_sendto, kNetworking, kImplemented);
 

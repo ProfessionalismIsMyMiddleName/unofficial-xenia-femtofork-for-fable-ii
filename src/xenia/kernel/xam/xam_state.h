@@ -11,11 +11,13 @@
 #define XENIA_KERNEL_XAM_XAM_STATE_H_
 
 #include <memory>
+
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/app_manager.h"
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/user_tracker.h"
+#include "xenia/kernel/xam/xam.h"
 
 namespace xe {
 class Emulator;
@@ -34,7 +36,7 @@ namespace xam {
 class XamState {
  public:
   XamState(Emulator* emulator, KernelState* kernel_state);
-  ~XamState();
+  ~XamState() = default;
 
   AppManager* app_manager() const { return app_manager_.get(); }
   ContentManager* content_manager() const { return content_manager_.get(); }
@@ -52,10 +54,32 @@ class XamState {
   bool IsUserSignedIn(uint32_t user_index) const;
   bool IsUserSignedIn(uint64_t xuid) const;
 
-  //
   void LoadSpaInfo(const SpaInfo* info);
 
+  void SetContentRegisterCallback(uint32_t callback);
+
+  bool IsUIActive() const {
+    return xam_dialogs_shown_ > 0 || xam_nui_dialogs_shown_ > 0;
+  }
+
+  uint32_t GetLanguageFallbackAddress(uint32_t index) const {
+    return language_fallback_address_[index];
+  }
+
+  uint32_t GetIptvNameAddress() const { return iptv_name_address_; }
+
+  X_DASH_APP_INFO dash_app_info_ = {};
+  uint32_t dash_backstack_nodes_count_ = 0;
+  X_DASH_BACKSTACK_DATA dash_backstack_data_[2] = {};
+  uint32_t content_register_callback = 0;
+
+  std::atomic<int32_t> xam_dialogs_shown_ = {0};
+  std::atomic<int32_t> xam_nui_dialogs_shown_ = {0};
+
  private:
+  void LoadLanguageLocaleFallback();
+  void LoadIptvServiceName();
+
   KernelState* kernel_state_;
 
   std::unique_ptr<AppManager> app_manager_;
@@ -65,6 +89,10 @@ class XamState {
   std::unique_ptr<ProfileManager> profile_manager_;
 
   std::unique_ptr<SpaInfo> spa_info_;
+
+  // Custom XAM stuff
+  std::array<uint32_t, 0x12> language_fallback_address_{};
+  uint32_t iptv_name_address_{};
 };
 
 }  // namespace xam

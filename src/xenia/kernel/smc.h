@@ -57,12 +57,45 @@ enum LED_STATE : uint8_t {
   ORANGE = 0x88
 };
 
+// https://free60.org/Hardware/Console/SMC_Command_0x01/#query-power-on-type
+enum POWERON_TYPE : uint8_t {
+  POWER_BUTTON = 0x11,
+  EJECT_BUTTON = 0x12,
+  RTC_WAKEUP = 0x15,
+  UNKNOWN_POWERON_1 = 0x16,
+  REMOTE_POWER_BUTTON = 0x20,
+  REMOTE_EJECT_BUTTON = 0x21,
+  REMOTE_X_BUTTON = 0x22,
+  REMOTE_WIN_BUTTON = 0x24,
+  HARD_RESET = 0x30,  // HalReturnToFirmware(1, 2, or 3)
+  RESET_CYCLE = 0x31,
+  UNKNOWN_POWERON_2 = 0x41,
+  KIOSK = 0x51,
+  WIRELESS_CONTROLLER_BUTTON =
+      0x55,  // controller middle button/start button (e.g. Turntable, drums,
+             // guitar, 360 controller)
+  GAME_PORT_1 = 0x56,
+  GAME_PORT_2 = 0x57,
+  EXPANSION_RESUME = 0x5A,
+};
+
+// https://free60.org/Hardware/Console/SMC_Command_0x82/
+enum class STANDBY_TYPE : uint16_t {
+  POWER_OFF = 0x0100,
+  POWER_OFF_RTC = 0x0132,  // verify this
+  HARD_RESET = 0x0430,     // 04 30 ??
+  SOFT_RESET = 0x0431,     // 04 31 ?? reset_cycle
+  CLEAR = 0x0433
+};
+
 // https://free60.org/Hardware/Console/SMC/
 enum X_SMC_CMD : uint8_t {
   POWERON_STATE = 0x1,
   QUERY_RTC = 0x4,
   QUERY_TEMP_SENSOR = 0x7,
   QUERY_TRAY = 0xA,
+  QUERY_UNK_0xB =
+      0xB,  // called on start up after VdQueryVideoMode on dash v13599
   QUERY_AV_PACK = 0xF,
   I2C_READ_WRITE = 0x11,
   QUERY_SMC_VERSION = 0x12,
@@ -109,6 +142,15 @@ struct X_SMC_DATA {
   union {
     uint8_t smc_data[15];
 
+    // POWERON_STATE
+    struct {
+      uint8_t poweron_state;
+      uint8_t reserved;  // always 00
+      uint8_t unk1;
+      uint8_t unk2;
+      uint8_t unk3;
+    } poweron_state;
+
     // QUERY_TEMP_SENSOR
     struct {
       X_TEMPERATURE_DATA cpu;
@@ -139,10 +181,16 @@ struct X_SMC_DATA {
       REMOTE_CONTROL ir_address;
     } ir_address;
 
-    // QUERY_TILT_STATE
+    // QUERY_TILT_SENSOR
     struct {
       TILT_STATE tilt_state;
     } tilt_state;
+
+    // SET_STANDBY
+    struct {
+      uint16_t standby_state;
+      uint8_t unkn;
+    } set_standby;
 
     // POWER_LED_STATE
     struct {
@@ -192,6 +240,7 @@ class SystemManagementController {
   void SetDriveTray(X_SMC_DATA* smc_message, X_SMC_DATA* smc_response);
   void SetFanSpeed(X_SMC_DATA* smc_message, X_SMC_DATA* smc_response);
   void SetIRAddress(X_SMC_DATA* smc_message, X_SMC_DATA* smc_response);
+  void SetStandby(X_SMC_DATA* smc_message, X_SMC_DATA* smc_response);
   void SetPowerLed(X_SMC_DATA* smc_message, X_SMC_DATA* smc_response);
   void SetLedState(X_SMC_DATA* smc_message, X_SMC_DATA* smc_response);
 

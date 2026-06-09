@@ -35,9 +35,11 @@
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
+#include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/linked_type_descriptor_set_allocator.h"
+#include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 #include "xenia/ui/vulkan/vulkan_provider.h"
 #include "xenia/ui/vulkan/vulkan_upload_buffer_pool.h"
@@ -54,7 +56,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
  public:
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
-    kUniformBufferCompute,
     kStorageBufferCompute,
     kCount,
   };
@@ -145,11 +146,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
+  void InitializeShaderStorage(
+      const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
+      std::function<void()> completion_callback = nullptr) override;
+
   void RestoreEdramSnapshot(const void* snapshot) override;
 
-  ui::vulkan::VulkanProvider& GetVulkanProvider() const {
-    return *static_cast<ui::vulkan::VulkanProvider*>(
-        graphics_system_->provider());
+  void PollCompletedSubmission() override;
+
+  ui::vulkan::VulkanDevice* GetVulkanDevice() const {
+    return static_cast<const ui::vulkan::VulkanProvider*>(
+               graphics_system_->provider())
+        ->vulkan_device();
   }
 
   // Returns the deferred drawing command list for the currently open
@@ -161,10 +169,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   bool submission_open() const { return submission_open_; }
   uint64_t GetCurrentSubmission() const {
-    return submission_completed_ +
-           uint64_t(submissions_in_flight_fences_.size()) + 1;
+    return completion_timeline_.GetUpcomingSubmission();
   }
-  uint64_t GetCompletedSubmission() const { return submission_completed_; }
+  uint64_t GetCompletedSubmission() const override {
+    return completion_timeline_.GetCompletedSubmissionFromLastUpdate();
+  }
 
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
@@ -220,16 +229,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // A frame must be open.
   VkDescriptorSet AllocateSingleTransientDescriptor(
       SingleTransientDescriptorLayout transient_descriptor_layout);
-  // Allocates a descriptor, space in the uniform buffer pool, and fills the
-  // VkWriteDescriptorSet structure and VkDescriptorBufferInfo referenced by it.
-  // Returns null in case of failure.
-  uint8_t* WriteTransientUniformBufferBinding(
-      size_t size, SingleTransientDescriptorLayout transient_descriptor_layout,
-      VkDescriptorBufferInfo& descriptor_buffer_info_out,
-      VkWriteDescriptorSet& write_descriptor_set_out);
-  uint8_t* WriteTransientUniformBufferBinding(
-      size_t size, SingleTransientDescriptorLayout transient_descriptor_layout,
-      VkDescriptorSet& descriptor_set_out);
 
   // The returned reference is valid until a cache clear.
   VkDescriptorSetLayout GetTextureDescriptorSetLayout(bool is_vertex,
@@ -420,7 +419,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
-  void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission);
+  void CheckSubmissionCompletionAndDeviceLoss(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -430,10 +429,15 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+  bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
-    return !submission_open_ && submissions_in_flight_fences_.empty();
+    CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
+    return !submission_open_ &&
+           GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
+
+  // Requests a readback buffer for CPU access to GPU data.
+  VkBuffer RequestReadbackBuffer(uint32_t size);
 
   void ClearTransientDescriptorPools();
 
@@ -441,9 +445,44 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void DestroyScratchBuffer();
 
+  // ZPD occlusion queries backend.
+  // vkCmdBeginQuery is only valid inside a render pass, so segments split at
+  // pass end and resume at the next pass begin. If BEGIN fires outside a pass,
+  // segment_pending_begin waits for the next. Outside a render pass,
+  // DiscardZPDQuery defers the slot release until the submission completes.
+  // FSI queries clear a dedicated counter with vkCmdFillBuffer, so they may
+  // need to open before a pass begins or split an active pass around the clear.
+  void EnsureZPDQueryResources() override;
+  void ShutdownZPDQueryResources() override {
+    zpd_resolves_in_flight_.clear();
+    zpd_deferred_releases_.clear();
+    zpd_active_query_index_ = UINT32_MAX;
+    zpd_active_query_generation_ = 0;
+    zpd_active_query_is_fsi_ = false;
+    zpd_query_pool_needs_fsi_counter_ = false;
+    zpd_fsi_counter_index_force_update_ = true;
+    if (zpd_host_query_pool_) {
+      zpd_host_query_pool_->Shutdown();
+    }
+  }
+
+  bool IsZPDQueryPoolReady() const override;
+  bool CanOpenZPDQuery() const override;
+
+  QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
+                               bool can_close_submission) override;
+  bool CloseZPDQuery(ReportHandle report_handle,
+                     uint64_t& out_submission) override;
+  bool DiscardZPDQuery() override;
+  void PumpQueryResolves() override;
+  bool AwaitQueryResolve(ReportHandle report_handle,
+                         uint64_t wait_for_submission) override;
+
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
-                          reg::RB_DEPTHCONTROL normalized_depth_control);
+                          reg::RB_DEPTHCONTROL normalized_depth_control,
+                          uint32_t draw_resolution_scale_x,
+                          uint32_t draw_resolution_scale_y);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -477,16 +516,34 @@ class VulkanCommandProcessor final : public CommandProcessor {
   VkPipelineStageFlags guest_shader_pipeline_stages_ = 0;
   VkShaderStageFlags guest_shader_vertex_stages_ = 0;
 
-  std::vector<VkFence> fences_free_;
   std::vector<VkSemaphore> semaphores_free_;
 
+  struct PendingQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    bool uses_fsi_counter = false;
+    ReportHandle report_handle = kInvalidReportHandle;
+  };
+  uint32_t zpd_active_query_index_ = UINT32_MAX;
+  uint32_t zpd_active_query_generation_ = 0;
+  bool zpd_active_query_is_fsi_ = false;
+  bool zpd_query_pool_needs_fsi_counter_ = false;
+  bool zpd_fsi_counter_index_force_update_ = true;
+  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  // Fallback buffer for EDRAM descriptor binding 2.
+  VkBuffer zpd_fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory zpd_fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  // Currently installed binding 2 buffer.
+  VkBuffer zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
+
+  ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   bool submission_open_ = false;
-  uint64_t submission_completed_ = 0;
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;
   std::vector<VkPipelineStageFlags> current_submission_wait_stage_masks_;
-  std::vector<VkFence> submissions_in_flight_fences_;
   std::deque<std::pair<uint64_t, VkSemaphore>>
       submissions_in_flight_semaphores_;
 
@@ -575,6 +632,18 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::unique_ptr<VulkanPrimitiveProcessor> primitive_processor_;
 
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
+
+  std::unique_ptr<VulkanZPDQueryPool> zpd_host_query_pool_;
+
+  // Deferred query slot releases for discards that happen outside a render
+  // pass, where vkCmdEndQuery cannot be issued.  The slot is held until the
+  // submission containing the stale BeginQuery completes on the GPU.
+  struct DeferredQueryRelease {
+    uint64_t submission;
+    uint32_t query_index;
+    uint32_t query_generation;
+  };
+  std::deque<DeferredQueryRelease> zpd_deferred_releases_;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
@@ -745,8 +814,27 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
 
+  // Clip plane constants.
+  SpirvShaderTranslator::ClipPlaneConstants clip_plane_constants_;
+
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // Per-resolve double-buffered readback for delayed sync
+  struct ReadbackBuffer {
+    VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    uint32_t sizes[2] = {0, 0};
+    uint32_t current_index = 0;
+    uint64_t last_used_frame = 0;
+  };
+  // Map: (written_address << 32 | written_length) -> ReadbackBuffer
+  std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+
+  // Simple single buffer for memexport (always syncs, no double-buffering)
+  VkBuffer memexport_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory memexport_readback_buffer_memory_ = VK_NULL_HANDLE;
+  uint32_t memexport_readback_buffer_size_ = 0;
 };
 
 }  // namespace vulkan

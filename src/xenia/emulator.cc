@@ -7,10 +7,9 @@
  ******************************************************************************
  */
 
-#include "xenia/emulator.h"
+#include <ranges>
 
-#include <algorithm>
-#include <cinttypes>
+#include "xenia/emulator.h"
 
 #include "config.h"
 #include "third_party/fmt/include/fmt/format.h"
@@ -64,6 +63,8 @@
 
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
+#elif XE_ARCH_ARM64
+#include "xenia/cpu/backend/a64/a64_backend.h"
 #endif  // XE_ARCH
 
 DEFINE_double(time_scalar, 1.0,
@@ -82,8 +83,6 @@ DEFINE_bool(allow_game_relative_writes, false,
             "relative to game://. Used for "
             "generating test data to compare with original hardware. ",
             "General");
-
-DECLARE_int32(user_language);
 
 DECLARE_bool(allow_plugins);
 
@@ -233,11 +232,17 @@ X_STATUS Emulator::Setup(
   if (cvars::cpu == "x64") {
     backend.reset(new xe::cpu::backend::x64::X64Backend());
   }
+#elif XE_ARCH_ARM64
+  if (cvars::cpu == "a64") {
+    backend.reset(new xe::cpu::backend::a64::A64Backend());
+  }
 #endif  // XE_ARCH
   if (cvars::cpu == "any") {
     if (!backend) {
 #if XE_ARCH_AMD64
       backend.reset(new xe::cpu::backend::x64::X64Backend());
+#elif XE_ARCH_ARM64
+      backend.reset(new xe::cpu::backend::a64::A64Backend());
 #endif  // XE_ARCH
     }
   }
@@ -282,10 +287,7 @@ X_STATUS Emulator::Setup(
   if (input_driver_factory) {
     auto input_drivers = input_driver_factory(display_window_);
     for (size_t i = 0; i < input_drivers.size(); ++i) {
-      auto& input_driver = input_drivers[i];
-      input_driver->set_is_active_callback(
-          []() -> bool { return !xe::kernel::xam::xeXamIsUIActive(); });
-      input_system_->AddDriver(std::move(input_driver));
+      input_system_->AddDriver(std::move(input_drivers[i]));
     }
   }
 
@@ -293,6 +295,9 @@ X_STATUS Emulator::Setup(
   if (result) {
     return result;
   }
+
+  // Add inputSystem to UI
+  imgui_drawer_->LoadInputSystem(input_system_.get());
 
   XELOGI("{}: Initializing VFS...", __func__);
   // Bring up the virtual filesystem used by the kernel.
@@ -540,7 +545,7 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
     case FileSignatureType::LIVE:
     case FileSignatureType::CON:
     case FileSignatureType::PIRS: {
-      mount_result = MountPath(path, "\\Device\\Cdrom0");
+      mount_result = MountPath(path, "\\Device\\Package_0");
       return mount_result ? mount_result : LaunchStfsContainer(path);
     } break;
     case FileSignatureType::XISO: {
@@ -570,17 +575,37 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
   auto file_name = path.filename();
 
   // Launch the game.
-  auto fs_path = "game:\\" + xe::path_to_utf8(file_name);
+  auto fs_path = fmt::format("{}\\", kDefaultGameSymbolicLink) +
+                 xe::path_to_utf8(file_name);
   X_STATUS result = CompleteLaunch(path, fs_path);
 
-  if (XSUCCEEDED(result)) {
-    kernel_state_->deployment_type_ = XDeploymentType::kHardDrive;
-    auto title_id = kernel_state_->title_id();
-    if (!kernel::IsSystemTitle(title_id)) {
-      // Assumption that any loaded game is loaded as a disc.
-      kernel_state_->deployment_type_ = XDeploymentType::kOpticalDisc;
-    }
+  if (XFAILED(result)) {
+    return result;
   }
+
+  kernel_state_->deployment_type_ = XDeploymentType::kInstalledToHDD;
+
+  if (!kernel::IsSystemTitle(kernel_state_->title_id())) {
+    return result;
+  }
+
+  const std::string mount_path =
+      utf8::find_base_guest_path(kernel_state_->GetExecutableModule()->path());
+
+  // System related symlinks. This should point to dashboard location in the
+  // future.
+  file_system_->RegisterSymbolicLink("\\SystemRoot", mount_path);
+
+  auto module = kernel_state_->LoadUserModule("xam.xex");
+
+  if (!module) {
+    module = kernel_state_->LoadUserModule("$flash_xam.xex");
+  }
+
+  if (module) {
+    result = kernel_state_->FinishLoadingUserModule(module, false);
+  }
+
   return result;
 }
 
@@ -613,7 +638,7 @@ X_STATUS Emulator::LaunchStfsContainer(const std::filesystem::path& path) {
   if (result == X_STATUS_NOT_FOUND && !cvars::launch_module.empty()) {
     return LaunchDefaultModule(path);
   }
-  kernel_state_->deployment_type_ = XDeploymentType::kGoD;
+  kernel_state_->deployment_type_ = XDeploymentType::kDownload;
   return result;
 }
 
@@ -623,7 +648,7 @@ X_STATUS Emulator::LaunchDefaultModule(const std::filesystem::path& path) {
   X_STATUS result = CompleteLaunch(path, module_path);
 
   if (XSUCCEEDED(result)) {
-    kernel_state_->deployment_type_ = XDeploymentType::kHardDrive;
+    kernel_state_->deployment_type_ = XDeploymentType::kInstalledToHDD;
     auto title_id = kernel_state_->title_id();
     if (!kernel::IsSystemTitle(title_id)) {
       // Assumption that any loaded game is loaded as a disc.
@@ -848,6 +873,10 @@ X_STATUS Emulator::InstallContentPackage(
       vfs::XContentContainerDevice::CreateContentDevice("", path);
 
   if (!device || !device->Initialize()) {
+    installation_info.installation_state_ = InstallState::failed;
+    installation_info.installation_error_message_ =
+        "Device initialization failed!";
+    installation_info.installation_result_ = X_STATUS_ACCESS_DENIED;
     XELOGE("Failed to initialize device");
     return X_STATUS_INVALID_PARAMETER;
   }
@@ -1084,7 +1113,7 @@ void Emulator::Resume() {
       continue;
     }
 
-    if (thread->is_running()) {
+    if (!thread->is_running()) {
       thread->thread()->Resume(nullptr);
     }
   }
@@ -1265,6 +1294,20 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   crash_msg.append(
       fmt::format("PC: 0x{:08X}\n",
                   guest_function->MapMachineCodeToGuestAddress(ex->pc())));
+  if (ex->code() == Exception::Code::kAccessViolation) {
+    const char* op_str = "unknown";
+    if (ex->access_violation_operation() ==
+        Exception::AccessViolationOperation::kRead) {
+      op_str = "read";
+    } else if (ex->access_violation_operation() ==
+               Exception::AccessViolationOperation::kWrite) {
+      op_str = "write";
+    }
+    crash_msg.append(fmt::format("Access Violation: {} at 0x{:016X}\n", op_str,
+                                 ex->fault_address()));
+  } else if (ex->code() == Exception::Code::kIllegalInstruction) {
+    crash_msg.append("Illegal Instruction\n");
+  }
   crash_msg.append("Registers:\n");
   for (int i = 0; i < 32; i++) {
     crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
@@ -1356,7 +1399,7 @@ void Emulator::RemoveGameConfigLoadCallback(GameConfigLoadCallback* callback) {
 }
 
 std::string Emulator::FindLaunchModule() {
-  std::string path("game:\\");
+  std::string path(fmt::format("{}\\", kDefaultGameSymbolicLink));
 
   auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
 
@@ -1401,7 +1444,15 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                   const std::string_view module_path) {
   // Making changes to the UI (setting the icon) and executing game config
   // load callbacks which expect to be called from the UI thread.
-  assert_true(display_window_->app_context().IsInUIThread());
+  // If not on UI thread, dispatch to it synchronously.
+  if (!display_window_->app_context().IsInUIThread()) {
+    X_STATUS result = X_STATUS_UNSUCCESSFUL;
+    display_window_->app_context().CallInUIThreadSynchronous(
+        [this, &path, &module_path, &result]() {
+          result = CompleteLaunch(path, module_path);
+        });
+    return result;
+  }
 
   // Setup NullDevices for raw HDD partition accesses
   // Cache/STFC code baked into games tries reading/writing to these
@@ -1502,58 +1553,134 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     kernel_state_->xam_state()->user_tracker()->AddTitleToPlayedList();
 
     if (game_info_database_->IsValid()) {
-      title_name_ = game_info_database_->GetTitleName(
-          static_cast<XLanguage>(cvars::user_language));
+      title_name_ = game_info_database_->GetTitleName(static_cast<XLanguage>(
+          kernel_state_->xconfig()->ReadSetting<uint32_t>(
+              kernel::XCONFIG_USER_CATEGORY, kernel::XCONFIG_USER_LANGUAGE)));
       XELOGI("Title name: {}", title_name_);
 
       // Show achievments data
       tabulate::Table table;
       table.format().multi_byte_characters(true);
-      table.add_row({"ID", "Title", "Description", "Gamerscore"});
+      table.add_row({"ID", "Title", "Description", "Type", "Gamerscore"});
 
       const std::vector<kernel::util::GameInfoDatabase::Achievement>
           achievement_list = game_info_database_->GetAchievements();
       for (const kernel::util::GameInfoDatabase::Achievement& entry :
            achievement_list) {
+        const std::string type = GetAchievementTypeName(
+            kernel::xam::GetAchievementType(entry.flags));
+
         table.add_row({fmt::format("{}", entry.id), entry.label,
-                       entry.description, fmt::format("{}", entry.gamerscore)});
+                       entry.description, type,
+                       fmt::format("{}", entry.gamerscore)});
       }
-      XELOGI("-------------------- ACHIEVEMENTS --------------------\n{}",
+      XELOGI("\n-------------------- ACHIEVEMENTS --------------------\n{}",
              table.str());
 
       const std::vector<kernel::util::GameInfoDatabase::Property>
           properties_list = game_info_database_->GetProperties();
 
+      // 4D5307DC SPA contains a lot of properties, limit properties to log.
+      const auto properties_list_limit =
+          properties_list | std::views::take(150);
+
       table = tabulate::Table();
       table.format().multi_byte_characters(true);
-      table.add_row({"ID", "Name", "Data Size"});
+      table.add_row({"ID", "Name", "Matchmaking", "Data Size"});
 
       for (const kernel::util::GameInfoDatabase::Property& entry :
-           properties_list) {
+           properties_list_limit) {
         std::string label =
             string_util::remove_eol(string_util::trim(entry.description));
+
         table.add_row({fmt::format("{:08X}", entry.id), label,
+                       entry.is_matchmaking ? "True" : "False",
                        fmt::format("{}", entry.data_size)});
       }
-      XELOGI("-------------------- PROPERTIES --------------------\n{}",
-             table.str());
+
+      std::string properties_totals;
+
+      if (properties_list.size() > properties_list_limit.size()) {
+        properties_totals =
+            fmt::format("\nProperties: {}/{}", properties_list_limit.size(),
+                        properties_list.size());
+      }
+
+      XELOGI("\n-------------------- PROPERTIES --------------------{}\n{}",
+             properties_totals.c_str(), table.str());
 
       const std::vector<kernel::util::GameInfoDatabase::Context> contexts_list =
           game_info_database_->GetContexts();
 
       table = tabulate::Table();
       table.format().multi_byte_characters(true);
-      table.add_row({"ID", "Name", "Default Value", "Max Value"});
+      table.add_row(
+          {"ID", "Name", "Matchmaking", "Default Value", "Max Value"});
 
       for (const kernel::util::GameInfoDatabase::Context& entry :
            contexts_list) {
         std::string label =
             string_util::remove_eol(string_util::trim(entry.description));
+
         table.add_row({fmt::format("{:08X}", entry.id), label,
+                       entry.is_matchmaking ? "True" : "False",
                        fmt::format("{}", entry.default_value),
                        fmt::format("{}", entry.max_value)});
       }
-      XELOGI("-------------------- CONTEXTS --------------------\n{}",
+      XELOGI("\n-------------------- CONTEXTS --------------------\n{}",
+             table.str());
+
+      const std::vector<kernel::util::GameInfoDatabase::StatsView> stats_views =
+          game_info_database_->GetStatsViews();
+
+      // 4D5307EA SPA contains a lot of stats, limit views to log.
+      const auto stats_views_limit = stats_views | std::views::take(100);
+
+      table = tabulate::Table();
+      table.format().multi_byte_characters(true);
+      table.add_row({"ID", "View Type", "Name", "Skilled", "Arbitrated",
+                     "Hidden", "Team View", "Online Only"});
+
+      for (const kernel::util::GameInfoDatabase::StatsView& entry :
+           stats_views_limit) {
+        const std::string name =
+            string_util::remove_eol(string_util::trim(entry.view.name));
+
+        const std::string view_type =
+            kernel::xam::GetViewTypeName(entry.view.view_type);
+
+        table.add_row({fmt::format("{:08X}", entry.view.id), view_type, name,
+                       entry.view.skilled ? "True" : "False",
+                       entry.view.arbitrated ? "True" : "False",
+                       entry.view.hidden ? "True" : "False",
+                       entry.view.team_view ? "True" : "False",
+                       entry.view.online_only ? "True" : "False"});
+      }
+
+      std::string stats_view_totals;
+
+      if (stats_views.size() > stats_views_limit.size()) {
+        stats_view_totals = fmt::format(
+            "\nViews: {}/{}", stats_views_limit.size(), stats_views.size());
+      }
+      XELOGI("\n-------------------- STATS VIEWS --------------------{}\n{}",
+             stats_view_totals.c_str(), table.str());
+
+      const std::vector<kernel::util::GameInfoDatabase::PresenceMode>
+          presence_modes = game_info_database_->GetPresenceModes();
+
+      table = tabulate::Table();
+      table.format().multi_byte_characters(true);
+      table.add_row({"Context Value", "Contexts Count", "Properties Count"});
+
+      for (const kernel::util::GameInfoDatabase::PresenceMode& entry :
+           presence_modes) {
+        table.add_row(
+            {fmt::format("{}", entry.context_value),
+             fmt::format("{}", entry.property_bag.contexts.size()),
+             fmt::format("{}", entry.property_bag.properties.size())});
+      }
+      XELOGI("\n-------------------- PRESENCE MODES --------------------\n{}",
              table.str());
 
       auto icon_block = game_info_database_->GetIcon();
@@ -1563,14 +1690,17 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     }
   }
 
-  // Initializing the shader storage in a blocking way so the user doesn't
-  // miss the initial seconds - for instance, sound from an intro video may
-  // start playing before the video can be seen if doing this in parallel with
-  // the main thread.
-  on_shader_storage_initialization(true);
-  graphics_system_->InitializeShaderStorage(cache_root_, title_id_.value(),
-                                            true);
-  on_shader_storage_initialization(false);
+  // Initialize shader storage asynchronously - pipeline compilation happens in
+  // background while the game goes through its normal startup (loading screens,
+  // intro videos, etc.). With async_shader_compilation enabled, draws are
+  // skipped until pipelines are ready, so this is safe. By the time actual
+  // gameplay starts, most cached pipelines should be compiled.
+  if (graphics_system_) {
+    on_shader_storage_initialization(true);
+    graphics_system_->InitializeShaderStorage(
+        cache_root_, title_id_.value(), false,
+        [this]() { on_shader_storage_initialization(false); });
+  }
 
   auto main_thread = kernel_state_->LaunchModule(module);
   if (!main_thread) {
@@ -1589,6 +1719,11 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                        module->hash().value());
     }
   }
+
+  // Resume the main thread now.
+  // If the debugger has requested a suspend this will just decrement the
+  // suspend count without resuming it until the debugger wants.
+  main_thread_->Resume();
 
   return X_STATUS_SUCCESS;
 }

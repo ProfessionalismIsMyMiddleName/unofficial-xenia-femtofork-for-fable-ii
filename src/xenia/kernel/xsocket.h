@@ -14,7 +14,6 @@
 #include <queue>
 
 #include "xenia/base/byte_order.h"
-#include "xenia/base/math.h"
 #include "xenia/kernel/xobject.h"
 
 namespace xe {
@@ -31,6 +30,7 @@ struct XSOCKADDR {
   xe::be<uint16_t> address_family;
   char sa_data[14];
 };
+static_assert_size(XSOCKADDR, 0x10);
 
 struct N_XSOCKADDR {
   N_XSOCKADDR() {}
@@ -54,6 +54,7 @@ struct XSOCKADDR_IN {
   // sin_zero is defined as __pad on Android, so prefixed here.
   char x_sin_zero[8];
 };
+static_assert_size(XSOCKADDR_IN, 0x10);
 
 // Xenia native sockaddr_in
 struct N_XSOCKADDR_IN {
@@ -89,13 +90,13 @@ class XSocket : public XObject {
   };
 
   enum Protocol {
-    IPPROTO_TCP = 6,
-    IPPROTO_UDP = 17,
+    XE_IPPROTO_TCP = 6,
+    XE_IPPROTO_UDP = 17,
 
     // LIVE Voice and Data Protocol
     // https://blog.csdn.net/baozi3026/article/details/4277227
     // Format: [cbGameData][GameData(encrypted)][VoiceData(unencrypted)]
-    IPPROTO_VDP = 254,
+    XE_IPPROTO_VDP = 254,
   };
 
   XSocket(KernelState* kernel_state);

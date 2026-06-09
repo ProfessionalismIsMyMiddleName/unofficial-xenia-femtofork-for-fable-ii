@@ -29,9 +29,10 @@ class GpdInfoProfile : public GpdInfo {
   GpdInfoProfile(const std::vector<uint8_t> buffer)
       : GpdInfo(kDashboardID, buffer) {};
 
-  ~GpdInfoProfile() {};
+  ~GpdInfoProfile() = default;
 
   void AddNewTitle(const SpaInfo* title_data);
+  bool RemoveTitle(const uint32_t title_id);
   void UpdateTitleInfo(const uint32_t title_id,
                        X_XDBF_GPD_TITLE_PLAYED* title_data);
 

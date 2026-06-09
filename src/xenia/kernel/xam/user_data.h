@@ -14,6 +14,7 @@
 #include <variant>
 #include <vector>
 
+#include "xenia/base/string_util.h"
 #include "xenia/xbox.h"
 
 namespace xe {
@@ -23,8 +24,7 @@ namespace xam {
 union AttributeKey {
   uint32_t value;
   struct {
-    uint32_t id : 14;
-    uint32_t unk : 2;
+    uint32_t id : 16;
     uint32_t size : 12;
     uint32_t type : 4;
   };
@@ -74,6 +74,19 @@ using UserDataTypes = std::variant<uint32_t, int32_t, float, int64_t, double,
                                    std::u16string, std::vector<uint8_t>>;
 
 constexpr uint32_t kMaxUserDataSize = 0x03E8;
+constexpr uint32_t kInvalidSize = 0xFFFF;
+
+constexpr uint32_t kPropertyScopeMask = 0x8000;
+constexpr uint32_t kPropertyIdMask = 0x7FFF;
+constexpr uint32_t kPropertyTypeMask = 0xF0000000;
+
+constexpr uint32_t kInvalidPropertyId = 0xFFFF;
+
+constexpr uint32_t kInvalidContextId = 0xFFFF;
+constexpr uint32_t kMaxContextId = 0x7FFF;
+
+constexpr uint32_t kInvalidContextValue = 0xFFFF;
+constexpr uint32_t kMaxContextValue = 0x7FFF;
 
 class UserData {
  public:
@@ -82,6 +95,29 @@ class UserData {
   const X_USER_DATA* get_data() const { return &data_; }
   std::span<const uint8_t> get_extended_data() const {
     return {extended_data_.data(), extended_data_.size()};
+  }
+
+  UserDataTypes get_host_data() const {
+    if (data_.type == X_USER_DATA_TYPE::INT32) {
+      return data_.data.s32;
+    }
+
+    if (data_.type == X_USER_DATA_TYPE::DATETIME) {
+      return data_.data.s64;
+    }
+
+    if (data_.type == X_USER_DATA_TYPE::WSTRING) {
+      if (get_extended_data().empty()) {
+        return std::u16string();
+      }
+
+      const char16_t* str_begin =
+          reinterpret_cast<const char16_t*>(get_extended_data().data());
+
+      return string_util::read_u16string_and_swap(str_begin);
+    }
+
+    return 0;
   }
 
   bool is_valid_type() const {
@@ -97,6 +133,11 @@ class UserData {
   static X_USER_DATA_TYPE get_type(uint32_t id) {
     return static_cast<X_USER_DATA_TYPE>(id >> 28);
   }
+
+  static bool is_system_property(uint32_t id) {
+    return (id & kPropertyScopeMask);
+  }
+
   static uint16_t get_max_size(uint32_t id) {
     return static_cast<uint16_t>(id >> 16) & kMaxUserDataSize;
   }
@@ -152,9 +193,7 @@ class UserData {
   }
 
  protected:
-  ~UserData();
-
-  UserData();
+  UserData() = default;
   UserData(const UserData& user_data);
 
   // From host
@@ -169,6 +208,8 @@ class UserData {
   // For data from GPD
   UserData(const X_USER_DATA_TYPE data_type, const X_USER_DATA_UNION* user_data,
            std::span<const uint8_t> extended_data);
+
+  ~UserData() = default;
 
   X_USER_DATA data_ = {};
   std::vector<uint8_t> extended_data_ = {};

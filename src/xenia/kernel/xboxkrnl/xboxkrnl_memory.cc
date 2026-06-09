@@ -7,14 +7,10 @@
  ******************************************************************************
  */
 
-#include <cstring>
-
-#include "xenia/base/assert.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/base/logging.h"
-#include "xenia/base/math.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
-#include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/xbox.h"
 
@@ -80,7 +76,14 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
   assert_not_null(region_size_ptr);
 
   // Set to TRUE when allocation is from devkit memory area.
-  assert_true(debug_memory == 0);
+  // We don't support separate devkit memory, so just ignore this flag.
+  if (debug_memory) {
+    XELOGW(
+        "Game is attempting to allocate devkit debug memory (base: {:08X}, "
+        "size: {:08X}). Ignoring debug flag and using normal allocation.",
+        base_addr_ptr ? uint32_t(*base_addr_ptr) : 0,
+        region_size_ptr ? uint32_t(*region_size_ptr) : 0);
+  }
 
   // This allocates memory from the kernel heap, which is initialized on startup
   // and shared by both the kernel implementation and user code.
@@ -561,32 +564,7 @@ dword_result_t MmQueryAllocationSize_entry(lpvoid_t base_address) {
 }
 DECLARE_XBOXKRNL_EXPORT1(MmQueryAllocationSize, kMemory, kImplemented);
 
-// https://code.google.com/p/vdash/source/browse/trunk/vdash/include/kernel.h
-struct X_MM_QUERY_STATISTICS_SECTION {
-  xe::be<uint32_t> available_pages;
-  xe::be<uint32_t> total_virtual_memory_bytes;
-  xe::be<uint32_t> reserved_virtual_memory_bytes;
-  xe::be<uint32_t> physical_pages;
-  xe::be<uint32_t> pool_pages;
-  xe::be<uint32_t> stack_pages;
-  xe::be<uint32_t> image_pages;
-  xe::be<uint32_t> heap_pages;
-  xe::be<uint32_t> virtual_pages;
-  xe::be<uint32_t> page_table_pages;
-  xe::be<uint32_t> cache_pages;
-};
-
-struct X_MM_QUERY_STATISTICS_RESULT {
-  xe::be<uint32_t> size;
-  xe::be<uint32_t> total_physical_pages;
-  xe::be<uint32_t> kernel_pages;
-  X_MM_QUERY_STATISTICS_SECTION title;
-  X_MM_QUERY_STATISTICS_SECTION system;
-  xe::be<uint32_t> highest_physical_page;
-};
-static_assert_size(X_MM_QUERY_STATISTICS_RESULT, 104);
-
-dword_result_t MmQueryStatistics_entry(
+dword_result_t xeMmQueryStatistics(
     pointer_t<X_MM_QUERY_STATISTICS_RESULT> stats_ptr) {
   if (!stats_ptr) {
     return X_STATUS_INVALID_PARAMETER;
@@ -653,6 +631,11 @@ dword_result_t MmQueryStatistics_entry(
 
   return X_STATUS_SUCCESS;
 }
+
+dword_result_t MmQueryStatistics_entry(
+    pointer_t<X_MM_QUERY_STATISTICS_RESULT> stats_ptr) {
+  return xeMmQueryStatistics(stats_ptr);
+}
 DECLARE_XBOXKRNL_EXPORT2(MmQueryStatistics, kMemory, kImplemented,
                          kHighFrequency);
 
@@ -693,7 +676,7 @@ struct X_POOL_ALLOC_HEADER {
 };
 
 uint32_t xeAllocatePoolTypeWithTag(PPCContext* context, uint32_t size,
-                                   uint32_t tag, uint32_t zero) {
+                                   uint32_t tag, uint32_t pool_selector) {
   if (size <= 0xFD8) {
     uint32_t adjusted_size = size + sizeof(X_POOL_ALLOC_HEADER);
 
@@ -711,9 +694,9 @@ uint32_t xeAllocatePoolTypeWithTag(PPCContext* context, uint32_t size,
 }
 
 dword_result_t ExAllocatePoolTypeWithTag_entry(dword_t size, dword_t tag,
-                                               dword_t zero,
+                                               dword_t pool_selector,
                                                const ppc_context_t& context) {
-  return xeAllocatePoolTypeWithTag(context, size, tag, zero);
+  return xeAllocatePoolTypeWithTag(context, size, tag, pool_selector);
 }
 DECLARE_XBOXKRNL_EXPORT1(ExAllocatePoolTypeWithTag, kMemory, kImplemented);
 
@@ -764,6 +747,11 @@ dword_result_t KeGetImagePageTableEntry_entry(dword_t address,
 
   if (image_heap->page_size() < 65536) {
     returned_value |= 0x40000000;
+
+    // TODO(Gliniak): Verify if 1 is set when page is marked as read-only. For
+    // now there is not enough data, but dashboard 14xxx and above requires that
+    // return from this call will have bit 0 set.
+    returned_value |= 1;
   }
 
   return returned_value & 0x400FFFFF;  // this is actually the mask it applies

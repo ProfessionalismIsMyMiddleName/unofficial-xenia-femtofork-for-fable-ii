@@ -19,19 +19,9 @@
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/xbox.h"
 
-DEFINE_bool(Allow_nui_initialization, false,
-            "Enable NUI initialization\n"
-            " Only set true when testing kinect games. Certain games may\n"
-            " require avatar implementation.",
-            "Kernel");
-
 namespace xe {
 namespace kernel {
 namespace xam {
-
-extern std::atomic<int> xam_dialogs_shown_;
-extern std::atomic<int> xam_nui_dialogs_shown_;
-
 // https://web.cs.ucdavis.edu/~okreylos/ResDev/Kinect/MainPage.html
 
 struct X_NUI_DEVICE_STATUS {
@@ -73,8 +63,14 @@ dword_result_t XamNuiGetDeviceStatus_entry(
   */
 
   status_ptr.Zero();
-  status_ptr->status = cvars::Allow_nui_initialization;
-  return cvars::Allow_nui_initialization ? X_ERROR_SUCCESS : 0xC0050006;
+
+  const bool kinect_initialized =
+      kernel_state()->xconfig()->ReadSetting<uint32_t>(
+          X_CONFIG_CATEGORY::XCONFIG_USER_CATEGORY, XCONFIG_USER_RETAIL_FLAGS) &
+      X_RETAIL_FLAGS::KinectInitialized;
+
+  status_ptr->status = kinect_initialized;
+  return kinect_initialized ? X_ERROR_SUCCESS : 0xC0050006;
 }
 DECLARE_XAM_EXPORT1(XamNuiGetDeviceStatus, kNone, kStub);
 
@@ -185,7 +181,9 @@ dword_result_t XamNuiCameraSetFlags_entry(qword_t unk1, dword_t unk2) {
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraSetFlags, kNone, kStub);
 
-dword_result_t XamIsNuiUIActive_entry() { return xeXamIsNuiUIActive(); }
+dword_result_t XamIsNuiUIActive_entry() {
+  return kernel_state()->xam_state()->xam_nui_dialogs_shown_ > 0;
+}
 DECLARE_XAM_EXPORT1(XamIsNuiUIActive, kNone, kImplemented);
 
 dword_result_t XamNuiIsDeviceReady_entry() {
@@ -197,8 +195,12 @@ dword_result_t XamNuiIsDeviceReady_entry() {
      - 0x0004
      - 0x0040
   */
-  uint16_t device_state = cvars::Allow_nui_initialization ? 1 : 0;
-  return device_state >> 1 & 1;
+  const bool kinect_initialized =
+      kernel_state()->xconfig()->ReadSetting<uint32_t>(
+          X_CONFIG_CATEGORY::XCONFIG_USER_CATEGORY, XCONFIG_USER_RETAIL_FLAGS) &
+      X_RETAIL_FLAGS::KinectInitialized;
+
+  return kinect_initialized >> 1 & 1;
 }
 DECLARE_XAM_EXPORT1(XamNuiIsDeviceReady, kNone, kImplemented);
 
@@ -327,11 +329,10 @@ void XamNuiHudGetVersions_entry(lpqword_t unk1, lpqword_t unk2) {
 DECLARE_XAM_EXPORT1(XamNuiHudGetVersions, kNone, kImplemented);
 
 // UI
-dword_result_t XamShowNuiTroubleshooterUI_entry(unknown_t unk1, unknown_t unk2,
-                                                dword_t flag) {
+dword_result_t XamShowNuiTroubleshooterUI_entry(dword_t user_index,
+                                                dword_t tracking_id,
+                                                dword_t flags) {
   /* Notes:
-     - unk1 is 0xFF - possibly user index?
-     - unk2 appear to always be zero.
      - calls XamPackageManagerGetExperienceMode(&var) with var = 1
      - If returns less than zero or (var & 1) == 0 then get error message:
        - if XamPackageManagerGetExperienceMode = 0 then call XamShowMessageBoxUI
@@ -339,8 +340,8 @@ dword_result_t XamShowNuiTroubleshooterUI_entry(unknown_t unk1, unknown_t unk2,
      returns 0
        - else XamShowNuiTroubleshooterUI returns 0x65b and call another func
      - else:
-       - call XamNuiHudSetEngagedTrackingID(unk2) and doesn't care aboot return
-     and set var2 = 2
+       - call XamNuiHudSetEngagedTrackingID(tracking_id) and doesn't care aboot
+     return and set var2 = 2
        - checks if (flag & 0x800000) == 0
          - if true call XamNuiGetDeviceStatus.
            - if XamNuiGetDeviceStatus != 0 set var2 = 3
@@ -368,9 +369,9 @@ dword_result_t XamShowNuiTroubleshooterUI_entry(unknown_t unk1, unknown_t unk2,
               "The game has indicated there is a problem with NUI (Kinect).")
               ->Then(&fence);
         })) {
-      ++xam_dialogs_shown_;
+      kernel_state()->xam_state()->xam_dialogs_shown_++;
       fence.Wait();
-      --xam_dialogs_shown_;
+      kernel_state()->xam_state()->xam_dialogs_shown_--;
     }
   }
 

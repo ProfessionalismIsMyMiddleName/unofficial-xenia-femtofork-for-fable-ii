@@ -9,7 +9,6 @@
 
 #include "xenia/cpu/compiler/passes/register_allocation_pass.h"
 
-#include <algorithm>
 #include <cstring>
 
 #include "xenia/base/assert.h"
@@ -511,7 +510,9 @@ void RegisterAllocationPass::SortUsageList(Value* value) {
       for (int i = 0; i < insize; i++) {
         psize++;
         q = q->next;
-        if (!q) break;
+        if (!q) {
+          break;
+        }
       }
       // if q hasn't fallen off end, we have two lists to merge
       int qsize = insize;

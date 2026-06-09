@@ -34,13 +34,6 @@ class Emulator;
 namespace xe {
 namespace gpu {
 
-static const std::vector<std::pair<uint16_t, uint16_t>>
-    internal_display_resolution_entries = {
-        {640, 480},  {640, 576},   {720, 480},  {720, 576},  {800, 600},
-        {848, 480},  {1024, 768},  {1152, 864}, {1280, 720}, {1280, 768},
-        {1280, 960}, {1280, 1024}, {1360, 768}, {1440, 900}, {1680, 1050},
-        {1920, 540}, {1920, 1080}};
-
 class CommandProcessor;
 
 class GraphicsSystem {
@@ -58,7 +51,7 @@ class GraphicsSystem {
   virtual X_STATUS Setup(cpu::Processor* processor,
                          kernel::KernelState* kernel_state,
                          ui::WindowedAppContext* app_context,
-                         bool is_surface_required);
+                         bool with_presentation);
   virtual void Shutdown();
 
   // May be called from any thread any number of times, even during recovery
@@ -79,8 +72,9 @@ class GraphicsSystem {
 
   virtual void ClearCaches();
 
-  void InitializeShaderStorage(const std::filesystem::path& cache_root,
-                               uint32_t title_id, bool blocking);
+  void InitializeShaderStorage(
+      const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
+      std::function<void()> completion_callback = nullptr);
 
   void RequestFrameTrace();
   void BeginTracing();
@@ -93,7 +87,7 @@ class GraphicsSystem {
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
 
-  static std::pair<uint16_t, uint16_t> GetInternalDisplayResolution();
+  std::pair<uint32_t, uint32_t> GetResolution() const;
 
   std::pair<uint32_t, uint32_t> GetScaledAspectRatio() const {
     return {scaled_aspect_x_, scaled_aspect_y_};

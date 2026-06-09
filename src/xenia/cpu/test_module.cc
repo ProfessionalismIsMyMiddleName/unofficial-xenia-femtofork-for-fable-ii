@@ -26,7 +26,8 @@ namespace passes = xe::cpu::compiler::passes;
 
 TestModule::TestModule(Processor* processor, const std::string_view name,
                        std::function<bool(uint32_t)> contains_address,
-                       std::function<bool(hir::HIRBuilder&)> generate)
+                       std::function<bool(hir::HIRBuilder&)> generate,
+                       bool skip_cf_simplification)
     : Module(processor),
       name_(name),
       contains_address_(contains_address),
@@ -39,7 +40,10 @@ TestModule::TestModule(Processor* processor, const std::string_view name,
   // Merge blocks early. This will let us use more context in other passes.
   // The CFG is required for simplification and dirtied by it.
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());
-  compiler_->AddPass(std::make_unique<passes::ControlFlowSimplificationPass>());
+  if (!skip_cf_simplification) {
+    compiler_->AddPass(
+        std::make_unique<passes::ControlFlowSimplificationPass>());
+  }
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());
 
   // Passes are executed in the order they are added. Multiple of the same
@@ -85,8 +89,13 @@ Symbol::Status TestModule::DeclareFunction(uint32_t address,
     // Reset() all caching when we leave.
     xe::make_reset_scope(compiler_);
     xe::make_reset_scope(assembler_);
+    xe::make_reset_scope(builder_);
+
+    // Set the HIRBuilder as current for this thread
+    builder_->MakeCurrent();
 
     if (!generate_(*builder_.get())) {
+      builder_->RemoveCurrent();
       function->set_status(Symbol::Status::kFailed);
       return Symbol::Status::kFailed;
     }
@@ -96,6 +105,9 @@ Symbol::Status TestModule::DeclareFunction(uint32_t address,
 
     // Assemble the function.
     assembler_->Assemble(function, builder_.get(), 0, nullptr);
+
+    // Remove the HIRBuilder as current for this thread
+    builder_->RemoveCurrent();
 
     status = Symbol::Status::kDefined;
     function->set_status(status);

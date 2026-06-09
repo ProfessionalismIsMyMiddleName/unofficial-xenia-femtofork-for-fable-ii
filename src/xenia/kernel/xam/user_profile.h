@@ -17,19 +17,19 @@
 #include <vector>
 
 #include "xenia/kernel/xam/user_property.h"
+#include "xenia/kernel/xam/xam.h"
 #include "xenia/kernel/xam/xdbf/gpd_info_profile.h"
 #include "xenia/kernel/xam/xdbf/gpd_info_title.h"
-#include "xenia/xbox.h"
 
 namespace xe {
 namespace kernel {
 namespace xam {
 
 enum class X_USER_PROFILE_SETTING_SOURCE : uint32_t {
-  NOT_SET = 0,
+  NO_VALUE = 0,
   DEFAULT = 1,  // Default value taken from default OS values.
   TITLE = 2,    // Value written by title or OS.
-  UNKNOWN = 3,
+  PERMISSION_DENIED = 3,
 };
 
 struct X_USER_PROFILE_SETTING {
@@ -45,6 +45,14 @@ struct X_USER_PROFILE_SETTING {
   };
 };
 static_assert_size(X_USER_PROFILE_SETTING, 40);
+
+enum class X_USER_PROFILE_GAMERCARD_ZONE_OPTIONS {
+  GAMERCARD_ZONE_NONE,
+  GAMERCARD_ZONE_RR,
+  GAMERCARD_ZONE_PRO,
+  GAMERCARD_ZONE_FAMILY,
+  GAMERCARD_ZONE_UNDERGROUND
+};
 
 enum class XTileType {
   kAchievement,
@@ -66,7 +74,7 @@ enum class XTileType {
 };
 
 // TODO: find filenames of other tile types that are stored in profile
-static const std::map<XTileType, std::string> kTileFileNames = {
+inline const std::map<XTileType, std::string> kTileFileNames = {
     {XTileType::kGamerTile, "tile_64.png"},
     {XTileType::kGamerTileSmall, "tile_32.png"},
     {XTileType::kPersonalGamerTile, "tile_64.png"},
@@ -75,27 +83,54 @@ static const std::map<XTileType, std::string> kTileFileNames = {
     {XTileType::kAvatarGamerTileSmall, "avtr_32.png"},
 };
 
+static constexpr std::pair<uint16_t, uint16_t> kProfileIconSize = {64, 64};
+static constexpr std::pair<uint16_t, uint16_t> kProfileIconSizeSmall = {32, 32};
+
+enum class SignInState : uint32_t {
+  NotSignedIn,
+  SignedInLocally,  // Offline
+  SignedInToLive,   // Online
+};
+
 class UserProfile {
  public:
-  UserProfile(uint64_t xuid, X_XAMACCOUNTINFO* account_info);
+  UserProfile(const uint64_t xuid, const X_XAMACCOUNTINFO* account_info);
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return account_info_.GetGamertagString(); }
-  uint32_t signin_state() const { return 1; }
+  uint32_t signin_state() const {
+    return static_cast<uint32_t>(SignInState::SignedInLocally);
+  };
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
+  uint32_t GetReservedFlags() const {
+    return account_info_.GetReservedFlags();
+  };
   uint32_t GetCachedFlags() const { return account_info_.GetCachedFlags(); };
+  uint32_t GetCountry() const {
+    return static_cast<uint32_t>(account_info_.GetCountry());
+  };
   uint32_t GetSubscriptionTier() const {
     return account_info_.GetSubscriptionTier();
   }
+  uint32_t GetLanguage() const {
+    return static_cast<uint32_t>(account_info_.GetLanguage());
+  };
+
+  bool IsParentalControlled() const {
+    return account_info_.IsParentalControlled();
+  };
+  bool IsLiveEnabled() const { return account_info_.IsLiveEnabled(); }
 
   std::span<const uint8_t> GetProfileIcon(XTileType icon_type) {
     // Overwrite same types?
-    if (icon_type == XTileType::kPersonalGamerTile) {
+    if (icon_type == XTileType::kPersonalGamerTile ||
+        icon_type == XTileType::kLocalGamerTile) {
       icon_type = XTileType::kGamerTile;
     }
 
-    if (icon_type == XTileType::kPersonalGamerTileSmall) {
+    if (icon_type == XTileType::kPersonalGamerTileSmall ||
+        icon_type == XTileType::kLocalGamerTileSmall) {
       icon_type = XTileType::kGamerTileSmall;
     }
 
@@ -130,6 +165,8 @@ class UserProfile {
 
   void LoadProfileGpds();
   void LoadProfileIcon(XTileType tile_type);
+  void WriteProfileIcon(XTileType tile_type,
+                        std::span<const uint8_t> icon_data);
   std::vector<uint8_t> LoadGpd(const uint32_t title_id);
   bool WriteGpd(const uint32_t title_id);
 };

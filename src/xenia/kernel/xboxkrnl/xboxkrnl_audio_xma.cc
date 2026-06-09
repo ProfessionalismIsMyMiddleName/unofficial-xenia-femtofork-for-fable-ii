@@ -7,11 +7,8 @@
  ******************************************************************************
  */
 
-#include <cstring>
-
 #include "xenia/apu/audio_system.h"
 #include "xenia/apu/xma_decoder.h"
-#include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
@@ -194,7 +191,7 @@ DECLARE_XBOXKRNL_EXPORT2(XMAInitializeContext, kAudio, kImplemented,
                          kHighFrequency);
 
 dword_result_t XMASetLoopData_entry(lpvoid_t context_ptr,
-                                    pointer_t<XMA_CONTEXT_DATA> loop_data) {
+                                    pointer_t<XMA_LOOP_DATA> loop_data) {
   XMA_CONTEXT_DATA context(context_ptr);
 
   context.loop_start = loop_data->loop_start;

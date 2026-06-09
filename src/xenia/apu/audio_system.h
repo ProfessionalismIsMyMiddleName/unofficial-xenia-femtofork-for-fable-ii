@@ -32,9 +32,12 @@ class AudioSystem {
  public:
   // TODO(gibbed): respect XAUDIO2_MAX_QUEUED_BUFFERS somehow (ie min(64,
   // XAUDIO2_MAX_QUEUED_BUFFERS))
+  static constexpr size_t kMinimumQueuedFrames = 4;
   static constexpr size_t kMaximumQueuedFrames = 64;
 
   virtual ~AudioSystem();
+
+  virtual std::string name() const = 0;
 
   Memory* memory() const { return memory_; }
   cpu::Processor* processor() const { return processor_; }

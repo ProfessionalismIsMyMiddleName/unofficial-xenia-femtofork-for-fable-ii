@@ -9,9 +9,7 @@
 
 #include "xenia/debug/ui/debug_window.h"
 
-#include <algorithm>
 #include <cinttypes>
-#include <utility>
 
 #include "third_party/capstone/include/capstone/capstone.h"
 #include "third_party/capstone/include/capstone/x86.h"
@@ -381,7 +379,7 @@ void DebugWindow::DrawSourcePane() {
   ImGui::EndGroup();
 
   ImGui::BeginGroup();
-  ImGui::PushButtonRepeat(true);
+  ImGui::PushItemFlag(ImGuiItemFlags_ButtonRepeat, true);
   bool can_step = !cache_.is_running && state_.thread_info;
   if (ImGui::ButtonEx("Step PPC", ImVec2(0, 0),
                       can_step ? 0 : ImGuiItemFlags_Disabled)) {
@@ -390,7 +388,7 @@ void DebugWindow::DrawSourcePane() {
       processor_->StepGuestInstruction(state_.thread_info->thread_id);
     }
   }
-  ImGui::PopButtonRepeat();
+  ImGui::PopItemFlag();
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip(
         "Step one PPC instruction on the current thread (hold for many).");
@@ -400,7 +398,7 @@ void DebugWindow::DrawSourcePane() {
     // Only show x64 step button if we have x64 visible.
     ImGui::Dummy(ImVec2(4, 0));
     ImGui::SameLine();
-    ImGui::PushButtonRepeat(true);
+    ImGui::PushItemFlag(ImGuiItemFlags_ButtonRepeat, true);
     if (ImGui::ButtonEx("Step x64", ImVec2(0, 0),
                         can_step ? 0 : ImGuiItemFlags_Disabled)) {
       // By enabling the button when stepping we allow repeat behavior.
@@ -408,7 +406,7 @@ void DebugWindow::DrawSourcePane() {
         processor_->StepHostInstruction(state_.thread_info->thread_id);
       }
     }
-    ImGui::PopButtonRepeat();
+    ImGui::PopItemFlag();
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip(
           "Step one x64 instruction on the current thread (hold for many).");
@@ -972,6 +970,7 @@ void DebugWindow::DrawRegistersPane() {
     } break;
     case RegisterGroup::kHostGeneral: {
       ImGui::BeginChild("##host_general");
+#if XE_ARCH_AMD64
       for (int i = 0; i < 18; ++i) {
         auto reg = static_cast<X64Register>(i);
         ImGui::BeginGroup();
@@ -992,10 +991,37 @@ void DebugWindow::DrawRegistersPane() {
         }
         ImGui::EndGroup();
       }
+#elif XE_ARCH_ARM64
+      // x0-x30, sp, pc, pstate
+      for (int i = 0; i < 34; ++i) {
+        auto reg = static_cast<Arm64Register>(i);
+        ImGui::BeginGroup();
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("%5s", HostThreadContext::GetRegisterName(reg));
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(4, 0));
+        ImGui::SameLine();
+        if (i < 31) {
+          dirty_host_context |=
+              DrawRegisterTextBox(i, &thread_info->host_context.x[i]);
+        } else if (i == 31) {
+          dirty_host_context |=
+              DrawRegisterTextBox(i, &thread_info->host_context.sp);
+        } else if (i == 32) {
+          dirty_host_context |=
+              DrawRegisterTextBox(i, &thread_info->host_context.pc);
+        } else {
+          dirty_host_context |=
+              DrawRegisterTextBox(i, &thread_info->host_context.pstate);
+        }
+        ImGui::EndGroup();
+      }
+#endif
       ImGui::EndChild();
     } break;
     case RegisterGroup::kHostVector: {
       ImGui::BeginChild("##host_vector");
+#if XE_ARCH_AMD64
       for (int i = 0; i < 16; ++i) {
         auto reg =
             static_cast<X64Register>(static_cast<int>(X64Register::kXmm0) + i);
@@ -1009,6 +1035,21 @@ void DebugWindow::DrawRegistersPane() {
             i, thread_info->host_context.xmm_registers[i].f32);
         ImGui::EndGroup();
       }
+#elif XE_ARCH_ARM64
+      for (int i = 0; i < 32; ++i) {
+        auto reg = static_cast<Arm64Register>(
+            static_cast<int>(Arm64Register::kV0) + i);
+        ImGui::BeginGroup();
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("%5s", HostThreadContext::GetRegisterName(reg));
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(4, 0));
+        ImGui::SameLine();
+        dirty_host_context |=
+            DrawRegisterTextBoxes(i, thread_info->host_context.v[i].f32);
+        ImGui::EndGroup();
+      }
+#endif
       ImGui::EndChild();
     }
   }

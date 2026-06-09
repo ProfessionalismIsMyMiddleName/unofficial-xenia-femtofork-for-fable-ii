@@ -244,7 +244,7 @@ class XexModule : public xe::cpu::Module {
   friend struct XexInfoCache;
   void ReadSecurityInfo();
 
-  int ReadImage(const void* xex_addr, size_t xex_length, bool use_dev_key);
+  int ReadImage(const void* xex_addr, size_t xex_length, const uint8_t* key);
   int ReadImageUncompressed(const void* xex_addr, size_t xex_length);
   int ReadImageBasicCompressed(const void* xex_addr, size_t xex_length);
   int ReadImageCompressed(const void* xex_addr, size_t xex_length);
@@ -255,7 +255,6 @@ class XexModule : public xe::cpu::Module {
                            const xex2_import_library* library);
   bool FindSaveRest();
 
-  Processor* processor_ = nullptr;
   kernel::KernelState* kernel_state_ = nullptr;
   std::string name_;
   std::string path_;

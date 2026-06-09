@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <utility>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -22,8 +24,11 @@
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_mem_alloc.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
+
+DECLARE_bool(tiled_shared_memory);
 
 namespace xe {
 namespace gpu {
@@ -423,10 +428,10 @@ constexpr VulkanTextureCache::HostFormatPair
         true};
 
 VulkanTextureCache::~VulkanTextureCache() {
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
 
   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair :
        samplers_) {
@@ -474,6 +479,19 @@ VulkanTextureCache::~VulkanTextureCache() {
   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
   // textures before destroying VMA.
   DestroyAllTextures(true);
+
+  // Clean up sparse scaled resolve resources (heaps and sparse buffers)
+  ShutdownSparseScaledResolve();
+
+  // Clean up simple scaled resolve buffers before destroying VMA
+  // The command processor should ensure all GPU operations are complete
+  // before the texture cache is destroyed
+  for (ScaledResolveBuffer& buffer : scaled_resolve_buffers_) {
+    if (buffer.buffer != VK_NULL_HANDLE) {
+      vmaDestroyBuffer(vma_allocator_, buffer.buffer, buffer.allocation);
+    }
+  }
+  scaled_resolve_buffers_.clear();
 
   if (vma_allocator_ != VK_NULL_HANDLE) {
     vmaDestroyAllocator(vma_allocator_);
@@ -523,9 +541,9 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
 }
 
 void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
-#if XE_UI_VULKAN_FINE_GRAINED_DRAW_SCOPES
+#if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
-#endif  // XE_UI_VULKAN_FINE_GRAINED_DRAW_SCOPES
+#endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   TextureCache::RequestTextures(used_texture_mask);
 
@@ -587,14 +605,37 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
 
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
     uint32_t fetch_constant_index, xenos::FetchOpDimension dimension,
-    bool is_signed) const {
+    bool is_signed) {
   VkImageView image_view = VK_NULL_HANDLE;
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
   if (binding && AreDimensionsCompatible(dimension, binding->key.dimension)) {
-    const VulkanTextureBinding& vulkan_binding =
-        vulkan_texture_bindings_[fetch_constant_index];
-    image_view = is_signed ? vulkan_binding.image_view_signed
-                           : vulkan_binding.image_view_unsigned;
+    // Check for 3D texture sampled as 2D.
+    bool force_special_view =
+        (dimension == xenos::FetchOpDimension::k2D &&
+         binding->key.dimension == xenos::DataDimension::k3D);
+
+    if (force_special_view) {
+      // Get the appropriate texture for signed/unsigned.
+      // Respect swizzled_signs from fetch constant, not just shader request.
+      Texture* texture = nullptr;
+      bool use_signed =
+          is_signed && texture_util::IsAnySignSigned(binding->swizzled_signs);
+      if (use_signed && IsSignedVersionSeparateForFormat(binding->key)) {
+        texture = binding->texture_signed;
+      } else {
+        texture = binding->texture;
+      }
+      if (texture) {
+        image_view =
+            static_cast<VulkanTexture*>(texture)->GetOrCreate3DAs2DImageView(
+                use_signed, binding->host_swizzle);
+      }
+    } else {
+      const VulkanTextureBinding& vulkan_binding =
+          vulkan_texture_bindings_[fetch_constant_index];
+      image_view = is_signed ? vulkan_binding.image_view_signed
+                             : vulkan_binding.image_view_unsigned;
+    }
   }
   if (image_view != VK_NULL_HANDLE) {
     return image_view;
@@ -673,14 +714,24 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
       binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
           ? fetch.aniso_filter
           : binding.aniso_filter;
-  parameters.aniso_filter = std::min(aniso_filter, max_anisotropy_);
   parameters.mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
 
-  uint32_t mip_min_level;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr,
-                                                 nullptr, nullptr, nullptr,
-                                                 &mip_min_level, nullptr);
+  uint32_t mip_min_level, mip_max_level;
+  texture_util::GetSubresourcesFromFetchConstant(
+      fetch, nullptr, nullptr, nullptr, nullptr, nullptr, &mip_min_level,
+      &mip_max_level);
   parameters.mip_min_level = mip_min_level;
+  bool has_mips = mip_max_level > mip_min_level;
+  // Apply anisotropic override, but only for mipmapped textures
+  // that are already using bilinear/trilinear filtering.
+  if (cvars::anisotropic_override > -1 && cvars::anisotropic_override < 6 &&
+      has_mips && !parameters.mip_base_map && parameters.mag_linear &&
+      parameters.min_linear &&
+      (mip_filter == xenos::TextureFilter::kPoint ||
+       mip_filter == xenos::TextureFilter::kLinear)) {
+    aniso_filter = xenos::AnisoFilter(cvars::anisotropic_override);
+  }
+  parameters.aniso_filter = std::min(aniso_filter, max_anisotropy_);
 
   return parameters;
 }
@@ -718,10 +769,10 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters,
     return sampler.second.sampler;
   }
 
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
 
   // See if an existing sampler can be destroyed to create space for the new
   // one.
@@ -761,7 +812,7 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters,
   // GetSamplerParameters.
   VkSamplerCreateInfo sampler_create_info = {};
   sampler_create_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-  if (provider.device_info().nonSeamlessCubeMap &&
+  if (vulkan_device->properties().nonSeamlessCubeMap &&
       cvars::non_seamless_cube_map) {
     sampler_create_info.flags |=
         VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
@@ -769,8 +820,8 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters,
   sampler_create_info.magFilter =
       parameters.mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
   sampler_create_info.minFilter =
-      parameters.mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-  sampler_create_info.mipmapMode = parameters.mag_linear
+      parameters.min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  sampler_create_info.mipmapMode = parameters.mip_linear
                                        ? VK_SAMPLER_MIPMAP_MODE_LINEAR
                                        : VK_SAMPLER_MIPMAP_MODE_NEAREST;
   static constexpr VkSamplerAddressMode kAddressModeMap[] = {
@@ -894,6 +945,7 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
     return VK_NULL_HANDLE;
   }
   if (!LoadTextureData(*texture)) {
+    XELOGE("Failed to load texture data for swap texture");
     return VK_NULL_HANDLE;
   }
   texture->MarkAsUsed();
@@ -923,6 +975,13 @@ VkImageView VulkanTextureCache::RequestSwapTexture(
   return texture_view;
 }
 
+bool VulkanTextureCache::IsScaledResolveSupportedForFormat(
+    TextureKey key) const {
+  // Check if the format has a valid host format pair, meaning we can handle it
+  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+  return host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED;
+}
+
 bool VulkanTextureCache::IsSignedVersionSeparateForFormat(
     TextureKey key) const {
   const HostFormatPair& host_format_pair = GetHostFormatPair(key);
@@ -940,17 +999,17 @@ uint32_t VulkanTextureCache::GetHostFormatSwizzle(TextureKey key) const {
 
 uint32_t VulkanTextureCache::GetMaxHostTextureWidthHeight(
     xenos::DataDimension dimension) const {
-  const ui::vulkan::VulkanProvider::DeviceInfo& device_info =
-      command_processor_.GetVulkanProvider().device_info();
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      command_processor_.GetVulkanDevice()->properties();
   switch (dimension) {
     case xenos::DataDimension::k1D:
     case xenos::DataDimension::k2DOrStacked:
       // 1D and 2D are emulated as 2D arrays.
-      return device_info.maxImageDimension2D;
+      return device_properties.maxImageDimension2D;
     case xenos::DataDimension::k3D:
-      return device_info.maxImageDimension3D;
+      return device_properties.maxImageDimension3D;
     case xenos::DataDimension::kCube:
-      return device_info.maxImageDimensionCube;
+      return device_properties.maxImageDimensionCube;
     default:
       assert_unhandled_case(dimension);
       return 0;
@@ -959,15 +1018,15 @@ uint32_t VulkanTextureCache::GetMaxHostTextureWidthHeight(
 
 uint32_t VulkanTextureCache::GetMaxHostTextureDepthOrArraySize(
     xenos::DataDimension dimension) const {
-  const ui::vulkan::VulkanProvider::DeviceInfo& device_info =
-      command_processor_.GetVulkanProvider().device_info();
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      command_processor_.GetVulkanDevice()->properties();
   switch (dimension) {
     case xenos::DataDimension::k1D:
     case xenos::DataDimension::k2DOrStacked:
       // 1D and 2D are emulated as 2D arrays.
-      return device_info.maxImageArrayLayers;
+      return device_properties.maxImageArrayLayers;
     case xenos::DataDimension::k3D:
-      return device_info.maxImageDimension3D;
+      return device_properties.maxImageDimension3D;
     case xenos::DataDimension::kCube:
       // Not requesting the imageCubeArray feature, and the Xenos doesn't
       // support cube map arrays.
@@ -1009,10 +1068,10 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
     return nullptr;
   }
 
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
 
   bool is_3d = key.dimension == xenos::DataDimension::k3D;
   uint32_t depth_or_array_size = key.GetDepthOrArraySize();
@@ -1043,13 +1102,18 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage =
       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  // For scaled resolve textures with mips, we need transfer source to generate
+  // mip levels via blit from the base level.
+  if (key.scaled_resolve && key.mip_max_level > 0) {
+    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VkImageFormatListCreateInfo image_format_list_create_info;
   if (formats[1] != VK_FORMAT_UNDEFINED &&
-      provider.device_info().ext_1_2_VK_KHR_image_format_list) {
+      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
     image_create_info_last->pNext = &image_format_list_create_info;
     image_create_info_last =
         reinterpret_cast<VkImageCreateInfo*>(&image_format_list_create_info);
@@ -1108,7 +1172,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   const texture_util::TextureGuestLayout& guest_layout =
       vulkan_texture.guest_layout();
   xenos::DataDimension dimension = texture_key.dimension;
+  // Whether the host image is 3D (determines depth vs array layer layout).
   bool is_3d = dimension == xenos::DataDimension::k3D;
+  // Whether to use 3D tiling when reading from guest memory.
+  // For 3D-as-2D wrappers, the host image is 2D but we need 3D tiling.
+  bool is_3d_tiling = is_3d || vulkan_texture.force_load_3d_tiling();
   uint32_t width = texture_key.GetWidth();
   uint32_t height = texture_key.GetHeight();
   uint32_t depth_or_array_size = texture_key.GetDepthOrArraySize();
@@ -1121,7 +1189,14 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   uint32_t bytes_per_block = guest_format_info->bytes_per_block();
   uint32_t level_first = load_base ? 0 : 1;
   uint32_t level_last = load_mips ? texture_key.mip_max_level : 0;
-  assert_true(level_first <= level_last);
+  // For scaled resolve textures, we only load level 0 from the scaled buffer -
+  // mips will be generated via blit.
+  uint32_t level_last_for_blit_gen = 0;
+  if (texture_key.scaled_resolve && level_last > 0) {
+    level_last_for_blit_gen = level_last;
+    level_last = 0;  // Only load base level from buffer
+  }
+  assert_true(level_first <= level_last || level_last_for_blit_gen > 0);
   uint32_t level_packed = guest_layout.packed_level;
   uint32_t level_stored_first = std::min(level_first, level_packed);
   uint32_t level_stored_last = std::min(level_last, level_packed);
@@ -1224,10 +1299,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // Begin loading.
   // TODO(Triang3l): Going from one descriptor to another on per-array-layer
   // or even per-8-depth-slices level to stay within maxStorageBufferRange.
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   VulkanSharedMemory& vulkan_shared_memory =
       static_cast<VulkanSharedMemory&>(shared_memory());
   std::array<VkWriteDescriptorSet, 3> write_descriptor_sets;
@@ -1260,12 +1335,6 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     write_descriptor_set_dest.pTexelBufferView = nullptr;
   }
   // TODO(Triang3l): Use a single 512 MB shared memory binding if possible.
-  // TODO(Triang3l): Scaled resolve buffer bindings.
-  // Aligning because if the data for a vector in a storage buffer is provided
-  // partially, the value read may still be (0, 0, 0, 0), and small (especially
-  // linear) textures won't be loaded correctly.
-  uint32_t source_length_alignment = UINT32_C(1)
-                                     << load_shader_info.source_bpe_log2;
   VkDescriptorSet descriptor_set_source_base = VK_NULL_HANDLE;
   VkDescriptorSet descriptor_set_source_mips = VK_NULL_HANDLE;
   VkDescriptorBufferInfo write_descriptor_set_source_base_buffer_info;
@@ -1278,12 +1347,64 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     if (!descriptor_set_source_base) {
       return false;
     }
-    write_descriptor_set_source_base_buffer_info.buffer =
-        vulkan_shared_memory.buffer();
-    write_descriptor_set_source_base_buffer_info.offset = texture_key.base_page
-                                                          << 12;
-    write_descriptor_set_source_base_buffer_info.range =
-        xe::align(vulkan_texture.GetGuestBaseSize(), source_length_alignment);
+    if (texture_key.scaled_resolve) {
+      // For scaled textures, read from scaled resolve buffers
+      uint32_t guest_address = texture_key.base_page << 12;
+      uint32_t guest_size = vulkan_texture.GetGuestBaseSize();
+
+      // Ensure the scaled buffer exists
+      if (EnsureScaledResolveMemoryCommitted(guest_address, guest_size)) {
+        // Make the range current
+        if (MakeScaledResolveRangeCurrent(guest_address, guest_size)) {
+          VkBuffer scaled_buffer = GetCurrentScaledResolveBuffer();
+          if (scaled_buffer != VK_NULL_HANDLE) {
+            // Calculate offset within the scaled buffer
+            uint32_t draw_resolution_scale_area =
+                draw_resolution_scale_x() * draw_resolution_scale_y();
+            uint64_t scaled_offset =
+                uint64_t(guest_address) * draw_resolution_scale_area;
+            uint64_t buffer_relative_offset =
+                scaled_offset - GetCurrentScaledResolveBufferBaseOffset();
+
+            write_descriptor_set_source_base_buffer_info.buffer = scaled_buffer;
+            write_descriptor_set_source_base_buffer_info.offset =
+                buffer_relative_offset;
+            // Align because shaders use up to 16-byte loads for multiple
+            // blocks at once.
+            write_descriptor_set_source_base_buffer_info.range = xe::align(
+                guest_size * draw_resolution_scale_area, uint32_t(16));
+          } else {
+            XELOGE(
+                "Scaled resolve texture load: Failed to get current scaled "
+                "buffer for texture at 0x{:08X}",
+                guest_address);
+            return false;
+          }
+        } else {
+          XELOGE(
+              "Scaled resolve texture load: Failed to make range current for "
+              "texture at 0x{:08X}",
+              guest_address);
+          return false;
+        }
+      } else {
+        XELOGE(
+            "Scaled resolve texture load: Failed to ensure scaled memory for "
+            "texture at 0x{:08X}",
+            guest_address);
+        return false;
+      }
+    } else {
+      // Regular unscaled texture - use shared memory
+      write_descriptor_set_source_base_buffer_info.buffer =
+          vulkan_shared_memory.buffer();
+      write_descriptor_set_source_base_buffer_info.offset =
+          texture_key.base_page << 12;
+      // Align (primarily the last row of linear textures) because shaders use
+      // up to 16-byte loads for multiple blocks at once.
+      write_descriptor_set_source_base_buffer_info.range =
+          xe::align(vulkan_texture.GetGuestBaseSize(), uint32_t(16));
+    }
     VkWriteDescriptorSet& write_descriptor_set_source_base =
         write_descriptor_sets[write_descriptor_set_count++];
     write_descriptor_set_source_base.sType =
@@ -1300,7 +1421,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         &write_descriptor_set_source_base_buffer_info;
     write_descriptor_set_source_base.pTexelBufferView = nullptr;
   }
-  if (level_last != 0) {
+  // For scaled resolve textures, we don't load mips from buffers - they will
+  // be generated via blit from the base level. For unscaled textures, load
+  // mips from shared memory as usual.
+  if (level_last != 0 && !texture_key.scaled_resolve) {
     descriptor_set_source_mips =
         command_processor_.AllocateSingleTransientDescriptor(
             VulkanCommandProcessor::SingleTransientDescriptorLayout ::
@@ -1308,12 +1432,15 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     if (!descriptor_set_source_mips) {
       return false;
     }
+    // Regular unscaled texture - use shared memory
     write_descriptor_set_source_mips_buffer_info.buffer =
         vulkan_shared_memory.buffer();
     write_descriptor_set_source_mips_buffer_info.offset = texture_key.mip_page
                                                           << 12;
+    // Align (primarily the last row of a linear packed mip tail) because
+    // shaders use up to 16-byte loads for multiple blocks at once.
     write_descriptor_set_source_mips_buffer_info.range =
-        xe::align(vulkan_texture.GetGuestMipsSize(), source_length_alignment);
+        xe::align(vulkan_texture.GetGuestMipsSize(), uint32_t(16));
     VkWriteDescriptorSet& write_descriptor_set_source_mips =
         write_descriptor_sets[write_descriptor_set_count++];
     write_descriptor_set_source_mips.sType =
@@ -1354,7 +1481,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   assert_true(texture_resolution_scale_x <= 7);
   assert_true(texture_resolution_scale_y <= 7);
   load_constants.is_tiled_3d_endian_scale =
-      uint32_t(texture_key.tiled) | (uint32_t(is_3d) << 1) |
+      uint32_t(texture_key.tiled) | (uint32_t(is_3d_tiling) << 1) |
       (uint32_t(texture_key.endianness) << 2) |
       (texture_resolution_scale_x << 4) | (texture_resolution_scale_y << 7);
 
@@ -1383,13 +1510,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base ? guest_layout.base : guest_layout.mips[level];
-    uint32_t level_guest_pitch = level_guest_layout.row_pitch_bytes;
-    if (texture_key.tiled) {
-      // Shaders expect pitch in blocks for tiled textures.
-      level_guest_pitch /= bytes_per_block;
-      assert_zero(level_guest_pitch & (xenos::kTextureTileWidthHeight - 1));
-    }
-    load_constants.guest_pitch_aligned = level_guest_pitch;
+    load_constants.guest_pitch_aligned =
+        level_guest_layout.row_pitch_bytes / bytes_per_block;
     load_constants.guest_z_stride_block_rows_aligned =
         level_guest_layout.z_slice_stride_block_rows;
     assert_true(dimension != xenos::DataDimension::k3D ||
@@ -1432,25 +1554,24 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     load_constants.host_pitch = load_shader_info.bytes_per_host_block *
                                 level_host_layout.x_pitch_blocks;
 
+    command_buffer.CmdVkPushConstants(load_pipeline_layout_,
+                                      VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                      sizeof(load_constants), &load_constants);
+
     uint32_t level_array_slice_stride_bytes_scaled =
         level_guest_layout.array_slice_stride_bytes *
         (texture_resolution_scale_x * texture_resolution_scale_y);
     for (uint32_t slice = 0; slice < array_size; ++slice) {
-      VkDescriptorSet descriptor_set_constants;
-      void* constants_mapping =
-          command_processor_.WriteTransientUniformBufferBinding(
-              sizeof(load_constants),
-              VulkanCommandProcessor::SingleTransientDescriptorLayout ::
-                  kUniformBufferCompute,
-              descriptor_set_constants);
-      if (!constants_mapping) {
-        return false;
+      if (slice != 0) {
+        command_buffer.CmdVkPushConstants(
+            load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+            offsetof(LoadConstants, guest_offset),
+            sizeof(load_constants.guest_offset), &load_constants.guest_offset);
+        command_buffer.CmdVkPushConstants(
+            load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+            offsetof(LoadConstants, host_offset),
+            sizeof(load_constants.host_offset), &load_constants.host_offset);
       }
-      std::memcpy(constants_mapping, &load_constants, sizeof(load_constants));
-      command_buffer.CmdVkBindDescriptorSets(
-          VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
-          kLoadDescriptorSetIndexConstants, 1, &descriptor_set_constants, 0,
-          nullptr);
       command_processor_.SubmitBarriers(true);
       command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                    load_constants.size_blocks[2]);
@@ -1532,6 +1653,97 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
   }
 
+  // Generate mip levels for scaled resolve textures via blit.
+  if (level_last_for_blit_gen > 0) {
+    VkImage image = vulkan_texture.image();
+    uint32_t scaled_width = width * texture_resolution_scale_x;
+    uint32_t scaled_height = height * texture_resolution_scale_y;
+
+    // Generate each mip level by blitting from the previous level.
+    for (uint32_t level = 1; level <= level_last_for_blit_gen; ++level) {
+      uint32_t src_width = std::max(scaled_width >> (level - 1), UINT32_C(1));
+      uint32_t src_height = std::max(scaled_height >> (level - 1), UINT32_C(1));
+      uint32_t src_depth = std::max(depth >> (level - 1), UINT32_C(1));
+      uint32_t dst_width = std::max(scaled_width >> level, UINT32_C(1));
+      uint32_t dst_height = std::max(scaled_height >> level, UINT32_C(1));
+      uint32_t dst_depth = std::max(depth >> level, UINT32_C(1));
+      // VkImageBlit offsets are int32_t - ensure dimensions fit.
+      assert_true(src_width <= INT32_MAX && src_height <= INT32_MAX &&
+                  src_depth <= INT32_MAX);
+      assert_true(dst_width <= INT32_MAX && dst_height <= INT32_MAX &&
+                  dst_depth <= INT32_MAX);
+
+      // Transition source mip (level - 1) to TRANSFER_SRC_OPTIMAL.
+      {
+        VkImageMemoryBarrier src_barrier = {};
+        src_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        src_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        src_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        src_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        src_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        src_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        src_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        src_barrier.image = image;
+        src_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        src_barrier.subresourceRange.baseMipLevel = level - 1;
+        src_barrier.subresourceRange.levelCount = 1;
+        src_barrier.subresourceRange.baseArrayLayer = 0;
+        src_barrier.subresourceRange.layerCount = array_size;
+        command_buffer.CmdVkPipelineBarrier(
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            0, nullptr, 0, nullptr, 1, &src_barrier);
+      }
+
+      // Blit from level - 1 to level.
+      VkImageBlit blit_region = {};
+      blit_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      blit_region.srcSubresource.mipLevel = level - 1;
+      blit_region.srcSubresource.baseArrayLayer = 0;
+      blit_region.srcSubresource.layerCount = array_size;
+      blit_region.srcOffsets[0] = {0, 0, 0};
+      blit_region.srcOffsets[1] = {static_cast<int32_t>(src_width),
+                                   static_cast<int32_t>(src_height),
+                                   static_cast<int32_t>(src_depth)};
+      blit_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      blit_region.dstSubresource.mipLevel = level;
+      blit_region.dstSubresource.baseArrayLayer = 0;
+      blit_region.dstSubresource.layerCount = array_size;
+      blit_region.dstOffsets[0] = {0, 0, 0};
+      blit_region.dstOffsets[1] = {static_cast<int32_t>(dst_width),
+                                   static_cast<int32_t>(dst_height),
+                                   static_cast<int32_t>(dst_depth)};
+
+      command_buffer.CmdVkBlitImage(image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    1, &blit_region, VK_FILTER_LINEAR);
+    }
+
+    // Transition all mip levels to the final layout (TRANSFER_DST for now,
+    // will be transitioned to shader read when used).
+    // Level 0 to level_last_for_blit_gen - 1 are in TRANSFER_SRC_OPTIMAL.
+    // Level level_last_for_blit_gen is in TRANSFER_DST_OPTIMAL (no change
+    // needed).
+    if (level_last_for_blit_gen > 0) {
+      VkImageMemoryBarrier final_barrier = {};
+      final_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      final_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      final_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      final_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      final_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      final_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      final_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      final_barrier.image = image;
+      final_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      final_barrier.subresourceRange.baseMipLevel = 0;
+      final_barrier.subresourceRange.levelCount = level_last_for_blit_gen;
+      final_barrier.subresourceRange.baseArrayLayer = 0;
+      final_barrier.subresourceRange.layerCount = array_size;
+      command_buffer.CmdVkPipelineBarrier(
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+          nullptr, 0, nullptr, 1, &final_barrier);
+    }
+  }
+
   return true;
 }
 
@@ -1579,8 +1791,10 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(
 
 VulkanTextureCache::VulkanTexture::VulkanTexture(
     VulkanTextureCache& texture_cache, const TextureKey& key, VkImage image,
-    VmaAllocation allocation)
-    : Texture(texture_cache, key), image_(image), allocation_(allocation) {
+    VmaAllocation allocation, bool track_usage)
+    : Texture(texture_cache, key, track_usage),
+      image_(image),
+      allocation_(allocation) {
   VmaAllocationInfo allocation_info;
   vmaGetAllocationInfo(texture_cache.vma_allocator_, allocation_,
                        &allocation_info);
@@ -1590,13 +1804,22 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
-  const ui::vulkan::VulkanProvider& provider =
-      vulkan_texture_cache.command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   for (const auto& view_pair : views_) {
     dfn.vkDestroyImageView(device, view_pair.second, nullptr);
   }
+  // Clean up 3D-as-2D image views. The texture_3d_as_2d_ wrapper will clean
+  // itself up via unique_ptr destructor.
+  if (image_view_3d_as_2d_unsigned_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, image_view_3d_as_2d_unsigned_, nullptr);
+  }
+  if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
+  }
+  // texture_3d_as_2d_ is a unique_ptr and will destroy its image/allocation.
   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
 }
 
@@ -1631,9 +1854,10 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed,
       is_signed && (host_format_pair.format_signed.format !=
                     host_format_pair.format_unsigned.format);
 
-  const ui::vulkan::VulkanProvider& provider =
-      vulkan_texture_cache.command_processor_.GetVulkanProvider();
-  if (!provider.device_info().imageViewFormatSwizzle) {
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+
+  if (!vulkan_device->properties().imageViewFormatSwizzle) {
     host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
   }
   view_key.host_swizzle = host_swizzle;
@@ -1647,8 +1871,8 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed,
   }
 
   // Create a new view.
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   VkImageViewCreateInfo view_create_info;
   view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   view_create_info.pNext = nullptr;
@@ -1690,6 +1914,135 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed,
   return view;
 }
 
+VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(
+    bool is_signed, uint32_t host_swizzle) {
+  if (!cvars::gpu_3d_to_2d_texture) {
+    return VK_NULL_HANDLE;
+  }
+
+  // Return cached view if available.
+  VkImageView& cached_view =
+      is_signed ? image_view_3d_as_2d_signed_ : image_view_3d_as_2d_unsigned_;
+  if (cached_view != VK_NULL_HANDLE) {
+    return cached_view;
+  }
+
+  VulkanTextureCache& vulkan_texture_cache =
+      static_cast<VulkanTextureCache&>(texture_cache());
+
+  // Create the 2D texture wrapper if it doesn't exist.
+  if (!texture_3d_as_2d_) {
+    const HostFormatPair& host_format_pair =
+        vulkan_texture_cache.GetHostFormatPair(key());
+    VkFormat format = host_format_pair.format_unsigned.format;
+    if (format == VK_FORMAT_UNDEFINED) {
+      return VK_NULL_HANDLE;
+    }
+
+    VkImageCreateInfo image_create_info = {};
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = format;
+    image_create_info.extent.width = key().GetWidth();
+    image_create_info.extent.height = key().GetHeight();
+    image_create_info.extent.depth = 1;
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocation_create_info = {};
+    allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+    VkImage image_2d;
+    VmaAllocation allocation_2d;
+    if (vmaCreateImage(vulkan_texture_cache.vma_allocator_, &image_create_info,
+                       &allocation_create_info, &image_2d, &allocation_2d,
+                       nullptr) != VK_SUCCESS) {
+      XELOGE("VulkanTexture: Failed to create 3D-as-2D image");
+      return VK_NULL_HANDLE;
+    }
+
+    // Create a modified key for the 2D wrapper with depth=1 and
+    // mip_max_level=0. Keep dimension as k3D so guest layout uses 3D tiling
+    // math to correctly read slice 0 from the 3D-tiled guest memory.
+    TextureKey key_2d = key();
+    key_2d.depth_or_array_size_minus_1 = 0;
+    key_2d.mip_max_level = 0;
+
+    // Create the wrapper first so LoadTextureData can work with it.
+    texture_3d_as_2d_.reset(new VulkanTexture(vulkan_texture_cache, key_2d,
+                                              image_2d, allocation_2d, false));
+
+    if (!vulkan_texture_cache.LoadTextureData(*texture_3d_as_2d_)) {
+      XELOGE("VulkanTexture: Failed to load 3D-as-2D texture data");
+      texture_3d_as_2d_.reset();
+      return VK_NULL_HANDLE;
+    }
+
+    // LoadTextureData leaves the texture in TRANSFER_DST state.
+    // Transition to shader read state.
+    DeferredCommandBuffer& command_buffer =
+        vulkan_texture_cache.command_processor_.deferred_command_buffer();
+    VkImageMemoryBarrier barrier_to_shader = {};
+    barrier_to_shader.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier_to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier_to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier_to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier_to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier_to_shader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier_to_shader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier_to_shader.image = texture_3d_as_2d_->image();
+    barrier_to_shader.subresourceRange =
+        ui::vulkan::util::InitializeSubresourceRange();
+    command_buffer.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier_to_shader);
+    texture_3d_as_2d_->SetUsage(Usage::kGuestShaderSampled);
+  }
+
+  // Create the image view.
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  const HostFormatPair& host_format_pair =
+      vulkan_texture_cache.GetHostFormatPair(key());
+  VkFormat format = (is_signed ? host_format_pair.format_signed
+                               : host_format_pair.format_unsigned)
+                        .format;
+  if (format == VK_FORMAT_UNDEFINED) {
+    return VK_NULL_HANDLE;
+  }
+
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = texture_3d_as_2d_->image();
+  // Use 2D_ARRAY to match shader expectations (Dim = 2D, Arrayed = 1).
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  view_create_info.format = format;
+  view_create_info.components.r = GetComponentSwizzle(host_swizzle, 0);
+  view_create_info.components.g = GetComponentSwizzle(host_swizzle, 1);
+  view_create_info.components.b = GetComponentSwizzle(host_swizzle, 2);
+  view_create_info.components.a = GetComponentSwizzle(host_swizzle, 3);
+  view_create_info.subresourceRange =
+      ui::vulkan::util::InitializeSubresourceRange();
+  view_create_info.subresourceRange.layerCount = 1;
+
+  if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &cached_view) !=
+      VK_SUCCESS) {
+    XELOGE("VulkanTexture: Failed to create 3D-as-2D image view");
+    return VK_NULL_HANDLE;
+  }
+
+  return cached_view;
+}
+
 VulkanTextureCache::VulkanTextureCache(
     const RegisterFile& register_file, VulkanSharedMemory& shared_memory,
     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
@@ -1698,24 +2051,22 @@ VulkanTextureCache::VulkanTextureCache(
     : TextureCache(register_file, shared_memory, draw_resolution_scale_x,
                    draw_resolution_scale_y),
       command_processor_(command_processor),
-      guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {
-  // TODO(Triang3l): Support draw resolution scaling.
-  assert_true(draw_resolution_scale_x == 1 && draw_resolution_scale_y == 1);
-}
+      guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
 bool VulkanTextureCache::Initialize() {
-  const ui::vulkan::VulkanProvider& provider =
-      command_processor_.GetVulkanProvider();
-  const ui::vulkan::VulkanProvider::InstanceFunctions& ifn = provider.ifn();
-  VkPhysicalDevice physical_device = provider.physical_device();
-  const ui::vulkan::VulkanProvider::DeviceFunctions& dfn = provider.dfn();
-  VkDevice device = provider.device();
-  const ui::vulkan::VulkanProvider::DeviceInfo& device_info =
-      provider.device_info();
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanInstance::Functions& ifn =
+      vulkan_device->vulkan_instance()->functions();
+  const VkPhysicalDevice physical_device = vulkan_device->physical_device();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      vulkan_device->properties();
 
   // Vulkan Memory Allocator.
 
-  vma_allocator_ = ui::vulkan::CreateVmaAllocator(provider, true);
+  vma_allocator_ = ui::vulkan::CreateVmaAllocator(vulkan_device, true);
   if (vma_allocator_ == VK_NULL_HANDLE) {
     return false;
   }
@@ -2099,12 +2450,11 @@ bool VulkanTextureCache::Initialize() {
       load_descriptor_set_layout_storage_buffer;
   load_descriptor_set_layouts[kLoadDescriptorSetIndexSource] =
       load_descriptor_set_layout_storage_buffer;
-  load_descriptor_set_layouts[kLoadDescriptorSetIndexConstants] =
-      command_processor_.GetSingleTransientDescriptorLayout(
-          VulkanCommandProcessor::SingleTransientDescriptorLayout ::
-              kUniformBufferCompute);
-  assert_true(load_descriptor_set_layouts[kLoadDescriptorSetIndexConstants] !=
-              VK_NULL_HANDLE);
+  VkPushConstantRange load_pipeline_layout_push_constant_range;
+  load_pipeline_layout_push_constant_range.stageFlags =
+      VK_SHADER_STAGE_COMPUTE_BIT;
+  load_pipeline_layout_push_constant_range.offset = 0;
+  load_pipeline_layout_push_constant_range.size = sizeof(LoadConstants);
   VkPipelineLayoutCreateInfo load_pipeline_layout_create_info;
   load_pipeline_layout_create_info.sType =
       VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -2112,8 +2462,9 @@ bool VulkanTextureCache::Initialize() {
   load_pipeline_layout_create_info.flags = 0;
   load_pipeline_layout_create_info.setLayoutCount = kLoadDescriptorSetCount;
   load_pipeline_layout_create_info.pSetLayouts = load_descriptor_set_layouts;
-  load_pipeline_layout_create_info.pushConstantRangeCount = 0;
-  load_pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  load_pipeline_layout_create_info.pushConstantRangeCount = 1;
+  load_pipeline_layout_create_info.pPushConstantRanges =
+      &load_pipeline_layout_push_constant_range;
   if (dfn.vkCreatePipelineLayout(device, &load_pipeline_layout_create_info,
                                  nullptr, &load_pipeline_layout_)) {
     XELOGE("VulkanTexture: Failed to create the texture load pipeline layout");
@@ -2323,7 +2674,7 @@ bool VulkanTextureCache::Initialize() {
         load_shader_code[i];
     assert_not_null(current_load_shader_code.first);
     load_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
-        provider, load_pipeline_layout_, current_load_shader_code.first,
+        vulkan_device, load_pipeline_layout_, current_load_shader_code.first,
         current_load_shader_code.second);
     if (load_pipelines_[i] == VK_NULL_HANDLE) {
       XELOGE(
@@ -2337,7 +2688,7 @@ bool VulkanTextureCache::Initialize() {
           current_load_shader_code_scaled = load_shader_code_scaled[i];
       if (current_load_shader_code_scaled.first) {
         load_pipelines_scaled_[i] = ui::vulkan::util::CreateComputePipeline(
-            provider, load_pipeline_layout_,
+            vulkan_device, load_pipeline_layout_,
             current_load_shader_code_scaled.first,
             current_load_shader_code_scaled.second);
         if (load_pipelines_scaled_[i] == VK_NULL_HANDLE) {
@@ -2402,7 +2753,7 @@ bool VulkanTextureCache::Initialize() {
   dfn.vkGetImageMemoryRequirements(device, null_image_3d_,
                                    &null_image_memory_requirements_3d_);
   uint32_t null_image_memory_type_common = ui::vulkan::util::ChooseMemoryType(
-      provider,
+      vulkan_device->memory_types(),
       null_image_memory_requirements_2d_array_cube_.memoryTypeBits &
           null_image_memory_requirements_3d_.memoryTypeBits,
       ui::vulkan::util::MemoryPurpose::kDeviceLocal);
@@ -2443,16 +2794,18 @@ bool VulkanTextureCache::Initialize() {
     }
   } else {
     // Place each null image in separate allocations.
-    uint32_t null_image_memory_type_2d_array_cube_ =
+    const uint32_t null_image_memory_type_2d_array_cube =
         ui::vulkan::util::ChooseMemoryType(
-            provider,
+            vulkan_device->memory_types(),
             null_image_memory_requirements_2d_array_cube_.memoryTypeBits,
             ui::vulkan::util::MemoryPurpose::kDeviceLocal);
-    uint32_t null_image_memory_type_3d_ = ui::vulkan::util::ChooseMemoryType(
-        provider, null_image_memory_requirements_3d_.memoryTypeBits,
-        ui::vulkan::util::MemoryPurpose::kDeviceLocal);
-    if (null_image_memory_type_2d_array_cube_ == UINT32_MAX ||
-        null_image_memory_type_3d_ == UINT32_MAX) {
+    const uint32_t null_image_memory_type_3d =
+        ui::vulkan::util::ChooseMemoryType(
+            vulkan_device->memory_types(),
+            null_image_memory_requirements_3d_.memoryTypeBits,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal);
+    if (null_image_memory_type_2d_array_cube == UINT32_MAX ||
+        null_image_memory_type_3d == UINT32_MAX) {
       XELOGE(
           "VulkanTextureCache: Failed to get the memory types for the null "
           "images");
@@ -2468,9 +2821,9 @@ bool VulkanTextureCache::Initialize() {
     null_image_memory_allocate_info.allocationSize =
         null_image_memory_requirements_2d_array_cube_.size;
     null_image_memory_allocate_info.memoryTypeIndex =
-        null_image_memory_type_2d_array_cube_;
+        null_image_memory_type_2d_array_cube;
     VkMemoryDedicatedAllocateInfo null_image_memory_dedicated_allocate_info;
-    if (device_info.ext_1_1_VK_KHR_dedicated_allocation) {
+    if (vulkan_device->extensions().ext_1_1_KHR_dedicated_allocation) {
       null_image_memory_allocate_info_last->pNext =
           &null_image_memory_dedicated_allocate_info;
       null_image_memory_allocate_info_last =
@@ -2500,8 +2853,7 @@ bool VulkanTextureCache::Initialize() {
 
     null_image_memory_allocate_info.allocationSize =
         null_image_memory_requirements_3d_.size;
-    null_image_memory_allocate_info.memoryTypeIndex =
-        null_image_memory_type_3d_;
+    null_image_memory_allocate_info.memoryTypeIndex = null_image_memory_type_3d;
     null_image_memory_dedicated_allocate_info.image = null_image_3d_;
     if (dfn.vkAllocateMemory(device, &null_image_memory_allocate_info, nullptr,
                              &null_images_memory_[1]) != VK_SUCCESS) {
@@ -2531,8 +2883,8 @@ bool VulkanTextureCache::Initialize() {
   // constant components instead of the real texels. The image will be cleared
   // to (0, 0, 0, 0) anyway.
   VkComponentSwizzle null_image_view_swizzle =
-      device_info.imageViewFormatSwizzle ? VK_COMPONENT_SWIZZLE_ZERO
-                                         : VK_COMPONENT_SWIZZLE_IDENTITY;
+      device_properties.imageViewFormatSwizzle ? VK_COMPONENT_SWIZZLE_ZERO
+                                               : VK_COMPONENT_SWIZZLE_IDENTITY;
   null_image_view_create_info.components.r = null_image_view_swizzle;
   null_image_view_create_info.components.g = null_image_view_swizzle;
   null_image_view_create_info.components.b = null_image_view_swizzle;
@@ -2571,17 +2923,23 @@ bool VulkanTextureCache::Initialize() {
   // VkDevice (true in a regular emulation scenario), so taking over all the
   // allocation slots exclusively.
   // Also leaving a few slots for use by things like overlay applications.
-  sampler_max_count_ =
-      device_info.maxSamplerAllocationCount -
-      uint32_t(ui::vulkan::VulkanProvider::HostSampler::kCount) - 16;
+  sampler_max_count_ = device_properties.maxSamplerAllocationCount -
+                       ui::vulkan::UISamplers::kSamplerCount - 16;
 
-  if (device_info.samplerAnisotropy) {
+  if (device_properties.samplerAnisotropy) {
     max_anisotropy_ = xenos::AnisoFilter(
         uint32_t(xenos::AnisoFilter::kMax_1_1) +
-        (31 - xe::lzcnt(uint32_t(std::min(
-                  16.0f, std::max(1.0f, device_info.maxSamplerAnisotropy))))));
+        (31 -
+         xe::lzcnt(uint32_t(std::min(
+             16.0f, std::max(1.0f, device_properties.maxSamplerAnisotropy))))));
   } else {
     max_anisotropy_ = xenos::AnisoFilter::kDisabled;
+  }
+
+  // Initialize sparse scaled resolve buffers if draw resolution scaling is
+  // enabled and sparse binding is supported.
+  if (!InitializeSparseScaledResolve()) {
+    return false;
   }
 
   return true;
@@ -2609,6 +2967,9 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
   layout = VK_IMAGE_LAYOUT_UNDEFINED;
   switch (usage) {
     case VulkanTexture::Usage::kUndefined:
+      // For UNDEFINED layout, use TOP_OF_PIPE as source stage (wait for
+      // nothing) with no access mask (discarding old contents).
+      stage_mask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
       break;
     case VulkanTexture::Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -2643,13 +3004,518 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(
       clamp_mode == xenos::ClampMode::kMirrorClampToHalfway ||
       clamp_mode == xenos::ClampMode::kMirrorClampToBorder) {
     // No equivalents for anything other than kMirrorClampToEdge in Vulkan.
-    return command_processor_.GetVulkanProvider()
-                   .device_info()
+    return command_processor_.GetVulkanDevice()
+                   ->properties()
                    .samplerMirrorClampToEdge
                ? xenos::ClampMode::kMirrorClampToEdge
                : xenos::ClampMode::kMirroredRepeat;
   }
   return clamp_mode;
+}
+
+bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    uint32_t length_scaled_alignment_log2) {
+  if (!IsDrawResolutionScaled()) {
+    return true;
+  }
+
+  // Dispatch to sparse implementation if supported
+  if (sparse_scaled_resolve_supported_) {
+    return EnsureScaledResolveMemoryCommittedSparse(
+        start_unscaled, length_unscaled, length_scaled_alignment_log2);
+  }
+
+  // Simple non-overlapping buffer implementation (fallback)
+  if (length_unscaled == 0) {
+    return true;
+  }
+
+  if (start_unscaled > SharedMemory::kBufferSize ||
+      (SharedMemory::kBufferSize - start_unscaled) < length_unscaled) {
+    return false;
+  }
+
+  uint32_t draw_resolution_scale_area =
+      draw_resolution_scale_x() * draw_resolution_scale_y();
+  uint64_t start_scaled = uint64_t(start_unscaled) * draw_resolution_scale_area;
+  uint64_t length_scaled_alignment_bits =
+      (UINT64_C(1) << length_scaled_alignment_log2) - 1;
+  uint64_t length_scaled =
+      (uint64_t(length_unscaled) * draw_resolution_scale_area +
+       length_scaled_alignment_bits) &
+      ~length_scaled_alignment_bits;
+
+  // Check if any existing buffer covers this range
+
+  bool range_covered = false;
+  for (const ScaledResolveBuffer& buffer : scaled_resolve_buffers_) {
+    if (buffer.range_start_scaled <= start_scaled &&
+        (buffer.range_start_scaled + buffer.range_length_scaled) >=
+            (start_scaled + length_scaled)) {
+      // This buffer covers the requested range
+      scaled_resolve_current_range_start_scaled_ = buffer.range_start_scaled;
+      scaled_resolve_current_range_length_scaled_ = buffer.range_length_scaled;
+      range_covered = true;
+      break;
+    }
+  }
+
+  if (!range_covered) {
+    // Need to create a new buffer or extend an existing one
+    // For simplicity and to avoid fragmentation, we'll use a fixed-size buffer
+    // approach similar to D3D12 (but smaller - 256MB chunks instead of 2GB)
+    constexpr uint64_t kBufferSize = 256 * 1024 * 1024;  // 256MB per buffer
+
+    // Round up the range to cover complete buffer chunks
+    uint64_t buffer_start = (start_scaled / kBufferSize) * kBufferSize;
+    uint64_t buffer_end =
+        ((start_scaled + length_scaled + kBufferSize - 1) / kBufferSize) *
+        kBufferSize;
+    uint64_t buffer_size = buffer_end - buffer_start;
+
+    // Check again if this expanded range is covered
+    bool expanded_range_covered = false;
+    for (const ScaledResolveBuffer& buffer : scaled_resolve_buffers_) {
+      if (buffer.range_start_scaled <= buffer_start &&
+          (buffer.range_start_scaled + buffer.range_length_scaled) >=
+              buffer_end) {
+        scaled_resolve_current_range_start_scaled_ = buffer.range_start_scaled;
+        scaled_resolve_current_range_length_scaled_ =
+            buffer.range_length_scaled;
+        expanded_range_covered = true;
+        break;
+      }
+    }
+
+    if (!expanded_range_covered) {
+      // Limit the number of buffers to prevent unbounded growth
+      constexpr size_t kMaxBuffers = 32;  // Maximum 8GB total (32 * 256MB)
+      if (scaled_resolve_buffers_.size() >= kMaxBuffers) {
+        // Reuse the least recently used buffer
+        // For now, just reuse the first buffer (simple LRU would be better)
+        ScaledResolveBuffer& reused_buffer = scaled_resolve_buffers_[0];
+        reused_buffer.range_start_scaled = buffer_start;
+        reused_buffer.range_length_scaled = buffer_size;
+        scaled_resolve_current_range_start_scaled_ = buffer_start;
+        scaled_resolve_current_range_length_scaled_ = buffer_size;
+      } else {
+        ScaledResolveBuffer new_buffer;
+        new_buffer.size = buffer_size;
+
+        VkBufferCreateInfo buffer_create_info = {};
+        buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        buffer_create_info.size = new_buffer.size;
+        buffer_create_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VmaAllocationCreateInfo allocation_create_info = {};
+        allocation_create_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+        VkResult result = vmaCreateBuffer(
+            vma_allocator_, &buffer_create_info, &allocation_create_info,
+            &new_buffer.buffer, &new_buffer.allocation, nullptr);
+
+        if (result != VK_SUCCESS) {
+          XELOGE(
+              "VulkanTextureCache: Failed to create scaled resolve buffer: {}",
+              static_cast<int>(result));
+          return false;
+        }
+
+        new_buffer.range_start_scaled = buffer_start;
+        new_buffer.range_length_scaled = buffer_size;
+
+        scaled_resolve_buffers_.push_back(new_buffer);
+        scaled_resolve_current_range_start_scaled_ = buffer_start;
+        scaled_resolve_current_range_length_scaled_ = buffer_size;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool VulkanTextureCache::MakeScaledResolveRangeCurrent(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    uint32_t length_scaled_alignment_log2) {
+  if (!IsDrawResolutionScaled()) {
+    return false;
+  }
+
+  // Dispatch to sparse implementation if supported
+  if (sparse_scaled_resolve_supported_) {
+    return MakeScaledResolveRangeCurrentSparse(start_unscaled, length_unscaled,
+                                               length_scaled_alignment_log2);
+  }
+
+  // Simple non-overlapping buffer implementation (fallback)
+  // First ensure the memory is committed (creates buffers if needed)
+  if (!EnsureScaledResolveMemoryCommitted(start_unscaled, length_unscaled,
+                                          length_scaled_alignment_log2)) {
+    return false;
+  }
+
+  const uint32_t draw_resolution_scale_area =
+      draw_resolution_scale_x() * draw_resolution_scale_y();
+  const uint64_t start_scaled =
+      uint64_t(start_unscaled) * draw_resolution_scale_area;
+
+  const uint64_t length_scaled_alignment_bits =
+      (UINT64_C(1) << length_scaled_alignment_log2) - 1;
+  const uint64_t length_scaled =
+      (uint64_t(length_unscaled) * draw_resolution_scale_area +
+       length_scaled_alignment_bits) &
+      ~length_scaled_alignment_bits;
+  const uint64_t end_scaled = start_scaled + length_scaled;
+
+  // Find which buffer contains this entire range (not just the start)
+  for (size_t i = 0; i < scaled_resolve_buffers_.size(); ++i) {
+    const ScaledResolveBuffer& buffer = scaled_resolve_buffers_[i];
+    if (start_scaled >= buffer.range_start_scaled &&
+        end_scaled <=
+            (buffer.range_start_scaled + buffer.range_length_scaled)) {
+      scaled_resolve_current_buffer_index_ = i;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+VkBuffer VulkanTextureCache::GetCurrentScaledResolveBuffer() const {
+  if (sparse_scaled_resolve_supported_) {
+    if (scaled_resolve_current_buffer_index_ < kMaxScaledResolveSparseBuffers &&
+        scaled_resolve_sparse_buffers_[scaled_resolve_current_buffer_index_]) {
+      return scaled_resolve_sparse_buffers_
+          [scaled_resolve_current_buffer_index_]
+              ->buffer();
+    }
+    return VK_NULL_HANDLE;
+  }
+  if (scaled_resolve_current_buffer_index_ >= scaled_resolve_buffers_.size()) {
+    return VK_NULL_HANDLE;
+  }
+  return scaled_resolve_buffers_[scaled_resolve_current_buffer_index_].buffer;
+}
+
+// Sparse scaled resolve helper functions
+
+size_t VulkanTextureCache::GetScaledResolveSparseBufferCount() const {
+  // Each buffer is 2GB, and buffer N covers [N GB .. (N+2) GB)
+  // So for an address space of X bytes, we need ceil((X-1) / 1GB) buffers
+  // (or 0 if X <= 2GB, but we handle that with max)
+  uint64_t address_space = uint64_t(SharedMemory::kBufferSize) *
+                           draw_resolution_scale_x() *
+                           draw_resolution_scale_y();
+  // Number of buffers needed: ceil((address_space - 1) / 1GB)
+  // For 3x3 (4.5GB): (4.5GB - 1) / 1GB = 3.5 -> 4 buffers
+  // For 2x2 (2GB): (2GB - 1) / 1GB = 0.99 -> 1 buffer
+  // For 1x1 (512MB): (512MB - 1) / 1GB = 0 -> but we need at least 1
+  if (address_space <= kScaledResolveSparseBufferSize) {
+    return 1;
+  }
+  return size_t((address_space - 1) >> 30);
+}
+
+std::array<size_t, 2> VulkanTextureCache::GetPossibleScaledResolveBufferIndices(
+    uint64_t address_scaled) const {
+  // Given an address, find which buffers could contain it.
+  // Buffer N covers [N GB .. (N+2) GB), so address A could be in:
+  // - Buffer floor(A/1GB) if it exists (address is in [N GB .. (N+1) GB) part)
+  // - Buffer floor(A/1GB) - 1 if it exists (address is in [(N-1)+1 GB .. N+1
+  // GB) part)
+  size_t gb_index = size_t(address_scaled >> 30);
+  size_t buffer_count = GetScaledResolveSparseBufferCount();
+  size_t max_buffer_index = buffer_count > 0 ? buffer_count - 1 : 0;
+
+  // First possible buffer: the one starting at this GB
+  size_t buffer_a = std::min(gb_index, max_buffer_index);
+  // Second possible buffer: the one starting 1GB earlier (if it exists)
+  size_t buffer_b = gb_index > 0 ? std::min(gb_index - 1, max_buffer_index)
+                                 : max_buffer_index + 1;  // Invalid
+
+  return {buffer_a, buffer_b};
+}
+
+bool VulkanTextureCache::InitializeSparseScaledResolve() {
+  if (!IsDrawResolutionScaled()) {
+    return true;
+  }
+
+  if (!cvars::tiled_shared_memory) {
+    XELOGI("VulkanTextureCache: Sparse scaled resolve disabled by CVAR");
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      vulkan_device->properties();
+
+  if (!device_properties.sparseBinding ||
+      !device_properties.sparseResidencyBuffer) {
+    XELOGI(
+        "VulkanTextureCache: Sparse binding not supported, using simple "
+        "buffers");
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkDevice device = vulkan_device->device();
+
+  size_t buffer_count = GetScaledResolveSparseBufferCount();
+  XELOGI(
+      "VulkanTextureCache: Creating {} sparse scaled resolve buffers (2GB "
+      "each)",
+      buffer_count);
+
+  // Create the sparse buffers
+  for (size_t i = 0; i < buffer_count; ++i) {
+    VkBufferCreateInfo buffer_create_info = {};
+    buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_create_info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
+                               VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+    buffer_create_info.size = kScaledResolveSparseBufferSize;
+    buffer_create_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer buffer;
+    VkResult result =
+        dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer);
+    if (result != VK_SUCCESS) {
+      XELOGE("VulkanTextureCache: Failed to create sparse buffer {}: error {}",
+             i, static_cast<int>(result));
+      ShutdownSparseScaledResolve();
+      return true;  // Fall back to simple buffers
+    }
+
+    scaled_resolve_sparse_buffers_[i] =
+        std::make_unique<ScaledResolveSparseBuffer>(buffer);
+  }
+
+  // Get memory requirements for the sparse buffers
+  VkMemoryRequirements memory_requirements;
+  dfn.vkGetBufferMemoryRequirements(device,
+                                    scaled_resolve_sparse_buffers_[0]->buffer(),
+                                    &memory_requirements);
+
+  // Find a suitable device-local memory type
+  if (!xe::bit_scan_forward(memory_requirements.memoryTypeBits &
+                                vulkan_device->memory_types().device_local,
+                            &scaled_resolve_memory_type_)) {
+    XELOGE(
+        "VulkanTextureCache: Failed to find suitable memory type for sparse "
+        "buffers");
+    ShutdownSparseScaledResolve();
+    return true;
+  }
+
+  // Calculate the number of heaps we might need
+  uint64_t address_space = uint64_t(SharedMemory::kBufferSize) *
+                           draw_resolution_scale_x() *
+                           draw_resolution_scale_y();
+  uint32_t max_heap_count =
+      uint32_t((address_space + kScaledResolveHeapSize - 1) >>
+               kScaledResolveHeapSizeLog2);
+  scaled_resolve_heaps_.resize(max_heap_count, VK_NULL_HANDLE);
+  scaled_resolve_heap_count_ = 0;
+
+  sparse_scaled_resolve_supported_ = true;
+  XELOGI(
+      "VulkanTextureCache: Sparse scaled resolve initialized with {} buffers, "
+      "max {} heaps",
+      buffer_count, max_heap_count);
+
+  return true;
+}
+
+void VulkanTextureCache::ShutdownSparseScaledResolve() {
+  const ui::vulkan::VulkanDevice* vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkDevice device = vulkan_device->device();
+
+  // Free all heaps
+  for (VkDeviceMemory heap : scaled_resolve_heaps_) {
+    if (heap != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, heap, nullptr);
+    }
+  }
+  scaled_resolve_heaps_.clear();
+  scaled_resolve_heap_count_ = 0;
+
+  // Destroy sparse buffers
+  for (auto& buffer : scaled_resolve_sparse_buffers_) {
+    if (buffer) {
+      dfn.vkDestroyBuffer(device, buffer->buffer(), nullptr);
+      buffer.reset();
+    }
+  }
+
+  scaled_resolve_memory_type_ = UINT32_MAX;
+  sparse_scaled_resolve_supported_ = false;
+}
+
+void VulkanTextureCache::BindHeapToOverlappingBuffers(uint32_t heap_index,
+                                                      VkDeviceMemory heap) {
+  // Calculate the address this heap covers
+  uint64_t heap_address = uint64_t(heap_index) << kScaledResolveHeapSizeLog2;
+
+  // Find which buffers this heap should be bound to
+  auto [buffer_a, buffer_b] =
+      GetPossibleScaledResolveBufferIndices(heap_address);
+
+  size_t buffer_count = GetScaledResolveSparseBufferCount();
+
+  // Bind to the first possible buffer
+  if (buffer_a < buffer_count && scaled_resolve_sparse_buffers_[buffer_a]) {
+    uint64_t offset_in_buffer =
+        heap_address - (uint64_t(buffer_a) << 30);  // buffer_a * 1GB
+
+    VkSparseMemoryBind bind = {};
+    bind.resourceOffset = offset_in_buffer;
+    bind.size = kScaledResolveHeapSize;
+    bind.memory = heap;
+    bind.memoryOffset = 0;
+    bind.flags = 0;
+
+    command_processor_.SparseBindBuffer(
+        scaled_resolve_sparse_buffers_[buffer_a]->buffer(), 1, &bind,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
+
+  // Bind to the second possible buffer (if different and valid)
+  if (buffer_b < buffer_count && buffer_b != buffer_a &&
+      scaled_resolve_sparse_buffers_[buffer_b]) {
+    uint64_t offset_in_buffer =
+        heap_address - (uint64_t(buffer_b) << 30);  // buffer_b * 1GB
+
+    VkSparseMemoryBind bind = {};
+    bind.resourceOffset = offset_in_buffer;
+    bind.size = kScaledResolveHeapSize;
+    bind.memory = heap;
+    bind.memoryOffset = 0;
+    bind.flags = 0;
+
+    command_processor_.SparseBindBuffer(
+        scaled_resolve_sparse_buffers_[buffer_b]->buffer(), 1, &bind,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
+}
+
+bool VulkanTextureCache::EnsureScaledResolveMemoryCommittedSparse(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    uint32_t length_scaled_alignment_log2) {
+  if (length_unscaled == 0) {
+    return true;
+  }
+
+  if (start_unscaled > SharedMemory::kBufferSize ||
+      (SharedMemory::kBufferSize - start_unscaled) < length_unscaled) {
+    return false;
+  }
+
+  uint32_t draw_resolution_scale_area =
+      draw_resolution_scale_x() * draw_resolution_scale_y();
+  uint64_t start_scaled = uint64_t(start_unscaled) * draw_resolution_scale_area;
+  uint64_t length_scaled_alignment_bits =
+      (UINT64_C(1) << length_scaled_alignment_log2) - 1;
+  uint64_t length_scaled =
+      (uint64_t(length_unscaled) * draw_resolution_scale_area +
+       length_scaled_alignment_bits) &
+      ~length_scaled_alignment_bits;
+  uint64_t end_scaled = start_scaled + length_scaled;
+
+  // Calculate which heaps we need
+  uint32_t heap_first = uint32_t(start_scaled >> kScaledResolveHeapSizeLog2);
+  uint32_t heap_last = uint32_t((end_scaled - 1) >> kScaledResolveHeapSizeLog2);
+
+  const ui::vulkan::VulkanDevice* vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkDevice device = vulkan_device->device();
+
+  // Allocate and bind any heaps we need
+  for (uint32_t heap_index = heap_first; heap_index <= heap_last;
+       ++heap_index) {
+    if (heap_index >= scaled_resolve_heaps_.size()) {
+      XELOGE("VulkanTextureCache: Heap index {} out of range (max {})",
+             heap_index, scaled_resolve_heaps_.size());
+      return false;
+    }
+
+    if (scaled_resolve_heaps_[heap_index] == VK_NULL_HANDLE) {
+      // Allocate a new heap
+      VkMemoryAllocateInfo allocate_info = {};
+      allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      allocate_info.allocationSize = kScaledResolveHeapSize;
+      allocate_info.memoryTypeIndex = scaled_resolve_memory_type_;
+
+      VkDeviceMemory heap;
+      VkResult result =
+          dfn.vkAllocateMemory(device, &allocate_info, nullptr, &heap);
+      if (result != VK_SUCCESS) {
+        XELOGE("VulkanTextureCache: Failed to allocate heap {}: error {}",
+               heap_index, static_cast<int>(result));
+        return false;
+      }
+
+      scaled_resolve_heaps_[heap_index] = heap;
+      ++scaled_resolve_heap_count_;
+
+      // Bind this heap to all overlapping buffers
+      BindHeapToOverlappingBuffers(heap_index, heap);
+    }
+  }
+
+  return true;
+}
+
+bool VulkanTextureCache::MakeScaledResolveRangeCurrentSparse(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    uint32_t length_scaled_alignment_log2) {
+  // First ensure the memory is committed
+  if (!EnsureScaledResolveMemoryCommittedSparse(start_unscaled, length_unscaled,
+                                                length_scaled_alignment_log2)) {
+    return false;
+  }
+
+  uint32_t draw_resolution_scale_area =
+      draw_resolution_scale_x() * draw_resolution_scale_y();
+  uint64_t start_scaled = uint64_t(start_unscaled) * draw_resolution_scale_area;
+  uint64_t length_scaled_alignment_bits =
+      (UINT64_C(1) << length_scaled_alignment_log2) - 1;
+  uint64_t length_scaled =
+      (uint64_t(length_unscaled) * draw_resolution_scale_area +
+       length_scaled_alignment_bits) &
+      ~length_scaled_alignment_bits;
+  uint64_t end_scaled = start_scaled + length_scaled;
+
+  // Find a buffer that contains the entire range
+  // Each buffer is 2GB and covers [buffer_index GB .. (buffer_index + 2) GB)
+  auto [buffer_a, buffer_b] =
+      GetPossibleScaledResolveBufferIndices(start_scaled);
+  auto [end_buffer_a, end_buffer_b] = GetPossibleScaledResolveBufferIndices(
+      end_scaled > 0 ? end_scaled - 1 : 0);
+
+  // Check if buffer_a can contain both start and end
+  size_t chosen_buffer = SIZE_MAX;
+  if (buffer_a == end_buffer_a || buffer_a == end_buffer_b) {
+    chosen_buffer = buffer_a;
+  } else if (buffer_b == end_buffer_a || buffer_b == end_buffer_b) {
+    chosen_buffer = buffer_b;
+  }
+
+  if (chosen_buffer == SIZE_MAX ||
+      chosen_buffer >= GetScaledResolveSparseBufferCount()) {
+    XELOGE("VulkanTextureCache: No buffer can contain range [{:X}, {:X})",
+           start_scaled, end_scaled);
+    return false;
+  }
+
+  scaled_resolve_current_buffer_index_ = chosen_buffer;
+  return true;
 }
 
 }  // namespace vulkan

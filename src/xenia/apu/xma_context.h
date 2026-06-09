@@ -14,8 +14,8 @@
 #include <atomic>
 #include <mutex>
 #include <queue>
-// #include <vector>
 
+#include "xenia/base/threading.h"
 #include "xenia/memory.h"
 #include "xenia/xbox.h"
 
@@ -68,20 +68,26 @@ struct XMA_CONTEXT_DATA {
   uint32_t loop_subframe_skip : 3;            // +17bit, XMASetLoopData might be
                                               // subframe_decode_count
   uint32_t subframe_decode_count : 4;         // +20bit
-  uint32_t subframe_skip_count : 3;           // +24bit
-  uint32_t sample_rate : 2;                   // +27bit enum of sample rates
-  uint32_t is_stereo : 1;                     // +29bit
-  uint32_t unk_dword_1_c : 1;                 // +30bit
-  uint32_t output_buffer_valid : 1;           // +31bit, XMAIsOutputBufferValid
+  uint32_t output_buffer_padding : 3;  // +24bit, extra output buffer blocks
+                                       // reserved per decoded frame
+                                       // NOTE(has207): this is pure guess
+                                       // but that's how we're using it
+                                       // currently
+  uint32_t sample_rate : 2;            // +27bit enum of sample rates
+  uint32_t is_stereo : 1;              // +29bit
+  uint32_t unk_dword_1_c : 1;          // +30bit
+  uint32_t output_buffer_valid : 1;    // +31bit, XMAIsOutputBufferValid
 
   // DWORD 2
   uint32_t input_buffer_read_offset : 26;  // XMAGetInputBufferReadOffset
-  uint32_t error_status : 6;               // ErrorStatus/ErrorSet (?)
+  uint32_t error_status : 5;               // ErrorStatus
+  uint32_t error_set : 1;                  // ErrorSet
 
   // DWORD 3
   uint32_t loop_start : 26;          // XMASetLoopData LoopStartOffset
                                      // frame offset in bits
-  uint32_t parser_error_status : 6;  // ? ParserErrorStatus/ParserErrorSet(?)
+  uint32_t parser_error_status : 5;  // ParserErrorStatus
+  uint32_t parser_error_set : 1;     // ParserErrorSet
 
   // DWORD 4
   uint32_t loop_end : 26;        // XMASetLoopData LoopEndOffset
@@ -147,6 +153,12 @@ struct XMA_CONTEXT_DATA {
   const uint32_t GetCurrentInputBufferPacketCount() const {
     return GetInputBufferPacketCount(current_buffer);
   }
+  const bool IsStreamingContext() const {
+    return (input_buffer_0_packet_count | input_buffer_1_packet_count) == 1;
+  }
+  const bool IsConsumeOnlyContext() const {
+    return (input_buffer_0_packet_count | input_buffer_1_packet_count) == 0;
+  }
 };
 static_assert_size(XMA_CONTEXT_DATA, 64);
 
@@ -161,8 +173,13 @@ static_assert_size(Xma2ExtraData, 34);
 class XmaContext {
  public:
   static constexpr uint32_t kBytesPerPacket = 2048;
+  static constexpr uint32_t kBytesPerPacketHeader = 4;
+  static constexpr uint32_t kBytesPerPacketData =
+      kBytesPerPacket - kBytesPerPacketHeader;
+
   static constexpr uint32_t kBitsPerPacket = kBytesPerPacket * 8;
   static constexpr uint32_t kBitsPerHeader = 32;
+  static constexpr uint32_t kBitsPerFrameHeader = 15;
 
   static constexpr uint32_t kBytesPerSample = 2;
   static constexpr uint32_t kSamplesPerFrame = 512;
@@ -172,8 +189,10 @@ class XmaContext {
   static constexpr uint32_t kBytesPerSubframeChannel =
       kSamplesPerSubframe * kBytesPerSample;
 
-  // static const uint32_t kOutputBytesPerBlock = 256;
-  // static const uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
+  static constexpr uint32_t kOutputBytesPerBlock = 256;
+  static constexpr uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
+
+  static constexpr uint32_t kLastFrameMarker = 0x7FFF;
 
   explicit XmaContext();
   virtual ~XmaContext();
@@ -184,7 +203,16 @@ class XmaContext {
   virtual bool Work() { return false; };
 
   virtual void Enable() {};
-  virtual bool Block(bool poll) { return 0; };
+  virtual bool Block(bool poll) {
+    std::unique_lock<xe_mutex> lock(lock_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+      if (poll) {
+        return false;
+      }
+      lock.lock();
+    }
+    return true;
+  }
   virtual void Clear() {};
   virtual void Disable() {};
   virtual void Release() {};
@@ -193,11 +221,28 @@ class XmaContext {
 
   uint32_t id() { return id_; }
   uint32_t guest_ptr() { return guest_ptr_; }
-  bool is_allocated() { return is_allocated_; }
-  bool is_enabled() { return is_enabled_; }
+  bool is_allocated() { return is_allocated_.load(std::memory_order_acquire); }
+  bool is_enabled() { return is_enabled_.load(std::memory_order_acquire); }
 
-  void set_is_allocated(bool is_allocated) { is_allocated_ = is_allocated; }
-  void set_is_enabled(bool is_enabled) { is_enabled_ = is_enabled; }
+  void set_is_allocated(bool is_allocated) {
+    is_allocated_.store(is_allocated, std::memory_order_release);
+  }
+  void set_is_enabled(bool is_enabled) {
+    is_enabled_.store(is_enabled, std::memory_order_release);
+  }
+
+  // Signals that the worker has finished processing this context after a kick.
+  void SignalWorkDone() {
+    if (work_completion_event_) {
+      work_completion_event_->Set();
+    }
+  }
+  // Blocks until the worker has finished processing this context.
+  void WaitForWorkDone() {
+    if (work_completion_event_) {
+      xe::threading::Wait(work_completion_event_.get(), false);
+    }
+  }
 
  protected:
   static void DumpRaw(AVFrame* frame, int id);
@@ -210,12 +255,13 @@ class XmaContext {
   uint32_t id_ = 0;
   uint32_t guest_ptr_ = 0;
   xe_mutex lock_;
-  volatile bool is_allocated_ = false;
-  volatile bool is_enabled_ = false;
+  std::atomic<bool> is_allocated_ = false;
+  std::atomic<bool> is_enabled_ = false;
+  std::unique_ptr<xe::threading::Event> work_completion_event_;
 
   // ffmpeg structures
   AVPacket* av_packet_ = nullptr;
-  AVCodec* av_codec_ = nullptr;
+  const AVCodec* av_codec_ = nullptr;
   AVCodecContext* av_context_ = nullptr;
   AVFrame* av_frame_ = nullptr;
 };

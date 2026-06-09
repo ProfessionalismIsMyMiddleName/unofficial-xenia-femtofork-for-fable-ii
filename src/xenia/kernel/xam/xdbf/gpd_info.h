@@ -10,14 +10,14 @@
 #ifndef XENIA_KERNEL_XAM_XDBF_GPD_INFO_H_
 #define XENIA_KERNEL_XAM_XDBF_GPD_INFO_H_
 
-#include "xenia/kernel/xam/user_data.h"
-#include "xenia/kernel/xam/xdbf/xdbf_io.h"
-
 #include <span>
 #include <string>
 #include <vector>
 
-#include "xenia/xbox.h"
+#include "xenia/base/byte_order.h"
+#include "xenia/kernel/util/xfiletime.h"
+#include "xenia/kernel/xam/user_data.h"
+#include "xenia/kernel/xam/xdbf/xdbf_io.h"
 
 namespace xe {
 namespace kernel {
@@ -32,6 +32,16 @@ enum class GpdSection : uint16_t {
   kTitle = 0x4,  // Dashboard Gpd exclusive
   kString = 0x5,
   kProtectedAchievement = 0x6,  // GFWL only
+};
+
+enum class AchievementTypeFlags : uint32_t {
+  kCompletion = 0x1,
+  kLeveling = 0x2,
+  kUnlock = 0x3,
+  kEvent = 0x4,
+  kTournament = 0x5,
+  kCheckpoint = 0x6,
+  kOther = 0x7,
 };
 
 enum class AchievementFlags : uint32_t {
@@ -105,11 +115,46 @@ struct X_XDBF_GPD_SETTING_HEADER {
 static_assert_size(X_XDBF_GPD_SETTING_HEADER, 0x18);
 #pragma pack(pop)
 
+inline AchievementTypeFlags constexpr GetAchievementType(const uint32_t flags) {
+  return static_cast<AchievementTypeFlags>(
+      flags & static_cast<uint32_t>(AchievementFlags::kTypeMask));
+}
+
+inline std::string constexpr GetAchievementTypeName(
+    const AchievementTypeFlags type) {
+  switch (type) {
+    case AchievementTypeFlags::kCompletion:
+      return "Completion";
+      break;
+    case AchievementTypeFlags::kLeveling:
+      return "Leveling";
+      break;
+    case AchievementTypeFlags::kUnlock:
+      return "Unlock";
+      break;
+    case AchievementTypeFlags::kEvent:
+      return "Event";
+      break;
+    case AchievementTypeFlags::kTournament:
+      return "Tournament";
+      break;
+    case AchievementTypeFlags::kCheckpoint:
+      return "Checkpoint";
+      break;
+    case AchievementTypeFlags::kOther:
+    default:
+      return "Other";
+      break;
+  }
+}
+
 class GpdInfo : public XdbfFile {
  public:
   GpdInfo();
   GpdInfo(const uint32_t title_id);
   GpdInfo(const uint32_t title_id, const std::vector<uint8_t> buffer);
+
+  ~GpdInfo() = default;
 
   // Normally GPD ALWAYS contains one free entry that indicates EOF
   bool IsValid() const { return !free_entries_.empty(); }
@@ -133,6 +178,7 @@ class GpdInfo : public XdbfFile {
                                const GpdSection section);
 
   void UpsertEntry(Entry* entry);
+  void DeleteEntry(const Entry* entry);
 
   uint32_t FindFreeLocation(const uint32_t entry_size);
 
@@ -142,7 +188,6 @@ class GpdInfo : public XdbfFile {
   uint32_t title_id_ = 0;
 
   void InsertEntry(Entry* entry);
-  void DeleteEntry(const Entry* entry);
 
   std::vector<const Entry*> GetSortedEntries() const;
 
