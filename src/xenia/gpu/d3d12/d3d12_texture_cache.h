@@ -536,7 +536,7 @@ class D3D12TextureCache final : public TextureCache {
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
- private:
+ public:
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;
   static constexpr uint32_t kLoadGuestYBlocksPerGroupLog2 = 5;
 
@@ -673,7 +673,7 @@ class D3D12TextureCache final : public TextureCache {
     // After an aliasing barrier (which is even stronger than an UAV barrier).
     void ClearUAVBarrierPending() { uav_barrier_pending_ = false; }
 
-   private:
+   public:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     bool uav_barrier_pending_ = false;

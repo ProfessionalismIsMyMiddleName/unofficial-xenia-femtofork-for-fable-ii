@@ -17,6 +17,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/emulator.h"
+#include "xenia/f2/hacks.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
 #include "xenia/gpu/draw_util.h"
@@ -2514,7 +2515,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    return IssueCopy(readback_resolve);
   }
 
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
@@ -3065,12 +3066,12 @@ bool D3D12CommandProcessor::IssueCopy() {
     return render_target_cache_->Resolve(*memory_, *shared_memory_,
                                          *texture_cache_, written_address,
                                          written_length);
-  } else {
-    return IssueCopy_ReadbackResolvePath();
   }
 }
+
 XE_NOINLINE
-bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(
+    ReadbackResolveRequirement readback_resolve) {
   uint32_t written_address, written_length;
   if (render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                     written_address, written_length)) {
@@ -3183,8 +3184,6 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         }
       }
     }
-  } else {
-    return false;
   }
   return true;
 }

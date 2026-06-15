@@ -1,75 +1,121 @@
-<p align="center">
-    <a href="https://github.com/xenia-canary/xenia-canary/tree/canary_experimental/assets/icon">
-        <img height="256px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
-    </a>
-</p>
+# Unofficial Xenia: Femtofork for Fable II
 
-<h1 align="center">Xenia Canary - Xbox 360 Emulator</h1>
+This is an unofficial fork of [Xenia Canary](https://github.com/xenia-canary/xenia-canary);
+it implements game-specific-hacks and features, unsuitable for mainline Xenia, that make emulating Fable II more pleasant.
 
-Xenia Canary is an experimental fork of the Xenia emulator. For more information, see the
-[Xenia Canary wiki](https://github.com/xenia-canary/xenia-canary/wiki).
+## Differences from Xenia Canary summarised
 
-Come chat with us about **emulator-related topics** on [Discord](https://discord.gg/Q9mxZf9).
-For developer chat join `#dev` but stay on topic. Lurking is not only fine, but encouraged!
-Please check the [FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page before asking questions.
-We've got jobs/lives/etc, so don't expect instant answers.
+Put briefly, these are the changes made by this fork:
+- The black-texture-bug no longer occurs for the player-character nor their dog.
+	- This applies even when resolution-scaling is active.
+	- This applies only to the D3D12 renderer. The black-texture-bug still occurs with the Vulkan renderer (the ground is transparent with the Vulkan renderer, regardless).
+- There are a few additional patches included in the `4D5307F1 - Fable II (GOTY_Platinum Edition).patch.toml` file.
+- Save files are automatically backed up, to guard against save file corruption.
+	- Just before the game overwrites a save file, a copy of that file will be made beside it, with a file-name of `<original-name>.<date-and-time-in-UTC>.bak`.
 
-Discussing illegal activities will get you banned.
+## Caveats
 
-## Status
+This has been tested only with Fable II's GOTY/Platinum Edition, some fixes/features may not work for other versions of the game. \
+Please file an issue if you find that a fix/feature does not work in your version of the game.
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Canary (🪟, 🐧) | [![CI](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental)](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental) [![Codacy Badge](https://app.codacy.com/project/badge/Grade/cd506034fd8148309a45034925648499)](https://app.codacy.com/gh/xenia-canary/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/xenia-canary/xenia-canary/releases/latest) ◦ [All](https://github.com/xenia-canary/xenia-canary/releases) ◦ [Old](https://github.com/xenia-canary/xenia-canary-releases/releases)
+## Usage
 
-### Experimental Netplay
+**Do not report bugs experienced when using this fork to the Xenia team, without first verifying that they also occur in the latest version of Xenia Canary.** \
+Similarly, do not request support from the Xenia team for features specific to this fork.
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Windows | [![Codacy Badge](https://app.codacy.com/project/badge/Grade/d814c4b6aa444dcc9c1631e0224b2739)](https://app.codacy.com/gh/AdrianCassar/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/AdrianCassar/xenia-canary/releases/latest)
+Avoid playing games other than Fable II with this fork—who knows what the game-specific-hacks could do elsewhere?
 
-## Quickstart
+### Step-by-step
 
-See the [Quickstart](https://github.com/xenia-canary/xenia-canary/wiki/Quickstart) page.
+1. Download the latest build of this fork from the [Releases](https://github.com/just-harry/unofficial-xenia-femtofork-for-fable-ii/releases) page.
+2. Follow [Xenia Canary's Quickstart guide](https://github.com/xenia-canary/xenia-canary/wiki/Quickstart).
 
-## FAQ
+### Migrating from Xenia Canary to this fork
 
-See the [frequently asked questions](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page.
+See the [out-of-place section](#out-of-place) for moving game saves over to a fresh installation of Xenia. \
+Otherwise, see the [in-place section](#in-place) for migrating over an existing installation of Xenia.
 
-## Game Compatibility
+#### Out-of-place
 
-See the [Game compatibility list](https://github.com/xenia-canary/game-compatibility/issues)
-for currently tracked games, and feel free to contribute your own updates,
-screenshots, and information there following the [existing conventions](https://github.com/xenia-canary/game-compatibility/blob/canary/README.md).
+Copy the `content` folder from your Xenia Canary installation (in the same folder as `xenia_canary.exe` is in) to your folder for this fork's installation.
 
-## Building
+To save storage space, you only need to copy the sub-folders for Fable II's saves and achievements, which are the in the following sub-folders:
+- Game saves: `content/<numbers and letters for your gamer profile>/<game ID>`
+	- For Fable II's GOTY/Platinum Edition the game ID is `4D5307F1`.
+- Achievement data: `content/<numbers and letters for your gamer profile>/FFFE07D1`
 
-See [building.md](docs/building.md) for setup and information about the
-`xb` script. When writing code, check the [style guide](docs/style_guide.md)
-and be sure to run clang-format!
+#### In-place
 
-## Contributors Wanted!
+It is recommended that you make a copy of the folder that your installation of Xenia Canary resides in, instead of overwriting its files.
 
-Have some spare time, know advanced C++, and want to write an emulator?
-Contribute! There's a ton of work that needs to be done, a lot of which
-is wide open greenfield fun.
+Simply replace the existing files of Xenia Canary with the files you downloaded for this fork.
 
-**For general rules and guidelines please see [CONTRIBUTING.md](.github/CONTRIBUTING.md).**
+You may need to delete the `cache_host/shaders` folder, wherein the cached shaders are found, as the cached shaders may cause the black-texture-bug to linger.
 
-Fixes and optimizations are always welcome (please!), but in addition to
-that there are some major work areas still untouched:
+If you had configured game patches previously, you will need to reconfigure them if you overwrote the `patches` folder.
 
-* Help work through [missing functionality/bugs in games](https://github.com/xenia-canary/xenia-canary/labels/compat)
-* Reduce the size of Xenia's [huge log files](https://github.com/xenia-canary/xenia-canary/issues/1526)
-* Skilled with Linux? A strong contributor is needed to [help with porting](https://github.com/xenia-canary/xenia-canary/labels/platform-linux)
+If you had previously enabled the `readback_resolve` setting to fix the black-texture-bug, you can disable it for a massive performance boost.
 
-See more projects [good for contributors](https://github.com/xenia-canary/xenia-canary/labels/good%20first%20issue). It's a good idea to ask on Discord and check the issues page before beginning work on
-something.
+### Pre-existing save files affected by the black-texture-bug
 
-## Disclaimer
+If your Fable II save file is already affected by the black-texture-bug, loading the save file in this fork will not immediately fix it.
 
-The goal of this project is to experiment, research, and educate on the topic
-of emulation of modern devices and operating systems. **It is not for enabling
-illegal activity**. All information is obtained via reverse engineering of
-legally purchased devices and games and information made public on the internet
-(you'd be surprised what's indexed on Google...).
+To fix the bug for the player-character, do something that will cause the game to regenerate the player-character's textures, such as changing the player-character's makeup, or altering their morality/purity significantly.
+
+To fix the bug for the player-character's clothing (such as gloves), unequip and reequip the affected clothing.
+
+The bug should be fixed for the player-character's dog simply by loading the save. If not, significantly alter the player-character's morality, or use a dog-breed-changing potion.
+
+## Issues not solved
+
+These issues, which are present in Xenia Canary, still occur in this fork:
+- The exploding-dog-mesh bug is still present. (Sometimes, the dog's 3D model will glitch out and stretch out across the screen.)
+- Lines of dialogue are sometimes skipped.
+- When resolution-scaling is active, the player-character's textures and clothing textures may be corrupted in the "Clothing" menu. \
+This corruption can cause the guest to crash. \
+(**Save your game before entering the "Clothing" menu when playing with resolution scaling.**)
+- The game may freeze during a loading-screen, necessitating a restart of the emulator.
+- The guest may crash during a loading-screen.
+- The guest may crash when navigating menus.
+- The guest may crash at various other points.
+
+## Differences from Xenia Canary detailed
+
+Put less briefly, these are the changes made by this fork and the issues they solve.
+
+### The dreaded black-texture-bug
+
+With Xenia's default settings, when the player-character reaches adulthood, their textures will disappear ([pictured here](https://github.com/xenia-canary/game-compatibility/issues/74#issuecomment-1098722361))—the same applies to their dog. \
+This isn't really a bug, it's more a consequence of the reality of emulating a unified-memory-architecture on machines with very much ununified-memory, but that doesn't make for a catchy name: so bug it is.
+
+It is possible to avoid this issue in mainline Xenia by enabling the `readback_resolve` setting.
+But this comes at great cost: doing so _obliterates_† the frame-rate, and if that alone wasn't bad enough, it also works only if resolution-scaling is disabled.
+
+†. To contextualise this usage of _obliterates_: on the author's machine, with resolution-scaling disabled, and `readback_resolve` disabled, a frame-rate ranging between 180 and 400 can be achieved at the shore of Bower Lake (near the foresty bit towards the north-east).
+When `readback_resolve` is enabled, the frame-rate instead ranges between **25** and 60. Those are the figures for a Ryzen 7950X3D paired with a Radeon 7900 XTX. _Obliterates_.
+
+It is possible to workaround this issue by loading an affected save with `readback_resolve` enabled and resolution-scaling disabled, and then doing something that causes the player-character's textures (and their dog's) to be regenerated, and then saving the game.
+Then, that save can be loaded with `readback_resolve` disabled and resolution-scaling enabled, and the textures will still be as they should... until the game regenerates the textures again for whatever reason. \
+Possible? Yes. Practical? Only for masochists.
+
+Now knowing that we can workaround the issue manually, surely we can automate a similar workaround? \
+Indeed we can, and that's exactly what this fork does. \
+The key insight here is that we don't need to have readback-resolve enabled all the time, we need it enabled only when the game is regenerating the textures affected by the issue.
+In fact, we don't even need to enable it, we just need to perform readback when the affected textures are resolved.
+
+So, after much exposition, what this fork does to prevent the black-texture-bug is: it simply performs readback only for the textures that need it, when they need it.
+
+There's still one problem with that approach, however, in mainline Xenia readback-resolve works only when resolution-scaling is disabled. \
+This fork lifts that limitation by downscaling upscaled textures when reading them back to the CPU. (So simple a solution it hurts).
+
+### Additional Patches
+
+This fork includes additional patches over the patch file for Fable II found in [Xenia Canary's Game Patches repo](https://github.com/xenia-canary/game-patches).
+
+Those patches are:
+1. A patch for skipping the unskippable intro videos that play when the game launches. (Authored by me).
+2. A patch that prevents the irritating strobing of certain lighting effects when resolution scaling is enabled, which was authored by Guy, and taken from the description of [Guy's "Fable 2 PC Ultimate Guide"](https://www.youtube.com/watch?v=98ACUnkzqx0). (Cheers, Guy).
+
+Some patches were removed, those patches are:
+1. Guy's "Disable Texture Morphing" patch, as it shouldn't be needed with this fork. (Sorry, Guy).
+

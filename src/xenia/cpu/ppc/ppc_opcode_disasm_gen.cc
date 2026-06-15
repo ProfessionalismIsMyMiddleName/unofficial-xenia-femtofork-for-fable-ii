@@ -899,6 +899,15 @@ void PrintDisasm_fsubx(const PPCDecodeData& d, StringBuffer* str) {
   str->Append(", ");
   str->AppendFormat("fr{}", d.A.FB());
 }
+void PrintDisasm_hack(const PPCDecodeData& d, StringBuffer* str) {
+  // hack[LK][AA] [ADDR]
+  size_t str_start = str->length();
+  str->Append("hack");
+  if (d.I.LK()) str->Append('l');
+  if (d.I.AA()) str->Append('a');
+  PadStringBuffer(str, str_start, kNamePad);
+  str->AppendFormat("0x{:X}", d.I.ADDR());
+}
 void PrintDisasm_icbi(const PPCDecodeData& d, StringBuffer* str) {
   // icbi [RA], [RB]
   size_t str_start = str->length();
@@ -5029,6 +5038,7 @@ PPCOpcodeDisasmInfo ppc_opcode_disasm_table[] = {
   INSTRUCTION(0xfc00002c, "fsqrtx"      , kA      , kF, kGeneral, "Floating Square Root"                                                       , PrintDisasm_fsqrtx),
   INSTRUCTION(0xec000028, "fsubsx"      , kA      , kF, kGeneral, "Floating Subtract Single"                                                   , PrintDisasm_fsubsx),
   INSTRUCTION(0xfc000028, "fsubx"       , kA      , kF, kGeneral, "Floating Subtract"                                                          , PrintDisasm_fsubx),
+  INSTRUCTION(0x58000000, "hack"        , kI      , kB, kGeneral, "Evil game-specific hack"                                                    , (PPCOpcodeField::kLK,PPCOpcodeField::kAA,PPCOpcodeField::kADDR), (), PrintDisasm_hack),
   INSTRUCTION(0x7c0007ac, "icbi"        , kX      , kM, kGeneral, "Instruction Cache Block Invalidate"                                         , PrintDisasm_icbi),
   INSTRUCTION(0x4c00012c, "isync"       , kXL     , kI, kGeneral, "Instruction Synchronize"                                                    , PrintDisasm_isync),
   INSTRUCTION(0x88000000, "lbz"         , kD      , kM, kGeneral, "Load Byte and Zero"                                                         , PrintDisasm_lbz),

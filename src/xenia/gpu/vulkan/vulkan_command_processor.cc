@@ -19,6 +19,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/emulator.h"
+#include "xenia/f2/hacks.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/packet_disassembler.h"
@@ -2304,10 +2305,10 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
-bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
-                                       uint32_t index_count,
-                                       IndexBufferInfo* index_buffer_info,
-                                       bool major_mode_explicit) {
+bool VulkanCommandProcessor::IssueDraw(
+    xenos::PrimitiveType prim_type, uint32_t index_count,
+    IndexBufferInfo* index_buffer_info,
+    ReadbackResolveRequirement readback_resolve) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2317,7 +2318,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    return IssueCopy(readback_resolve);
   }
 
   const ui::vulkan::VulkanDevice::Properties& device_properties =
@@ -2923,7 +2924,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   return true;
 }
 
-bool VulkanCommandProcessor::IssueCopy() {
+bool VulkanCommandProcessor::IssueCopy(
+    ReadbackResolveRequirement readback_resolve) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES

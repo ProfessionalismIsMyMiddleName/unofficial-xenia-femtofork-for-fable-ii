@@ -154,6 +154,13 @@
 #define XE_UNLIKELY_IF(...) if (!!(__VA_ARGS__)) [[unlikely]]
 #define XE_MAYBE_UNUSED
 #endif
+
+#if XE_COMPILER_HAS_GNU_EXTENSIONS == 1
+#define XE_UNREACHABLE __builtin_unreachable()
+#else
+#define XE_UNREACHABLE __assume(0)
+#endif
+
 // only use __restrict if MSVC, for clang/gcc we can use -fstrict-aliasing which
 // acts as __restrict across the board todo: __restrict is part of the type
 // system, we might actually have to still emit it on clang and gcc

@@ -42,8 +42,8 @@ class NullCommandProcessor : public CommandProcessor {
 
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info,
-                 bool major_mode_explicit) override;
-  bool IssueCopy() override;
+                 ReadbackResolveRequirement readback_resolve) override;
+  bool IssueCopy(ReadbackResolveRequirement readback_resolve) override;
 
   void InitializeTrace() override;
 };

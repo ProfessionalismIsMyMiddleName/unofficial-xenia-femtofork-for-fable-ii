@@ -94,6 +94,7 @@ PPCOpcodeInfo ppc_opcode_table[] = {
   INSTRUCTION(0xfc00002c, "fsqrtx"      , kA      , kF, kGeneral),
   INSTRUCTION(0xec000028, "fsubsx"      , kA      , kF, kGeneral),
   INSTRUCTION(0xfc000028, "fsubx"       , kA      , kF, kGeneral),
+  INSTRUCTION(0x58000000, "hack"        , kI      , kB, kGeneral),
   INSTRUCTION(0x7c0007ac, "icbi"        , kX      , kM, kGeneral),
   INSTRUCTION(0x4c00012c, "isync"       , kXL     , kI, kGeneral),
   INSTRUCTION(0x88000000, "lbz"         , kD      , kM, kGeneral),

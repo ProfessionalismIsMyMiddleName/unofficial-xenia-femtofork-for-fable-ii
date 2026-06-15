@@ -78,6 +78,12 @@ target_link_libraries(xenia-app PRIVATE
   xxhash
 )
 
+# Fable 2 Specific
+target_link_libraries(xenia-app PRIVATE
+  xenia-f2
+)
+
+
 # Vulkan/SPIR-V backends (not macOS)
 if(NOT APPLE)
   target_link_libraries(xenia-app PRIVATE

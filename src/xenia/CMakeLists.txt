@@ -49,6 +49,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_subdirectory(apu/alsa)
 endif()
 
+# Fable 2 Specific code
+add_subdirectory(f2)
+
+
 if(WIN32)
   add_subdirectory(apu/xaudio2)
   add_subdirectory(gpu/d3d12)
