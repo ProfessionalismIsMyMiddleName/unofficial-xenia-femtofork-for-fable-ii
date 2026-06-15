@@ -445,12 +445,12 @@ class CommandProcessor {
      with `readback_resolve`, instead of appending `readback_resolve`
      as a new parameter, because `major_mode_explicit` is unused and four
      parameters makes for a more efficient ABI than five parameters. */
-  virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
-                         IndexBufferInfo* index_buffer_info,
-                         ReadbackResolveRequirement readback_resolve) {
-    return false;
-  }
-  virtual bool IssueCopy(ReadbackResolveRequirement readback_resolve) {
+  virtual bool IssueDraw(
+      xenos::PrimitiveType prim_type,
+      uint32_t index_count,
+      IndexBufferInfo* index_buffer_info,
+      bool major_mode_explicit) override;
+  virtual bool IssueCopy() {
     return false;
   }
 

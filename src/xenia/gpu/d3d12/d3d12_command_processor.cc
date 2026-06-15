@@ -2515,7 +2515,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy(readback_resolve);
+    return IssueCopy();
   }
 
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {

@@ -1170,7 +1170,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
 
       draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
           vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-          is_indexed ? &index_buffer_info : nullptr, readback_resolve);
+          is_indexed ? &index_buffer_info : nullptr, 
+          xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
+                                     vgt_draw_initiator.prim_type));
       if (!draw_succeeded) {
         XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,
                vgt_draw_initiator.num_indices,
