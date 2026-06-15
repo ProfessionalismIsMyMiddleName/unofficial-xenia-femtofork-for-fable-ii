@@ -1150,7 +1150,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
 
       ReadbackResolveRequirement readback_resolve;
 
-      if (GetGPUSetting(GPUSetting::ReadbackResolve)) {
+      if (GetReadbackResolveMode() != ReadbackResolveMode::kDisabled) {
         readback_resolve = ReadbackResolveRequirement::Absolute;
       } else {
         static_assert((uint32_t)ReadbackResolveRequirement::None == 0);
