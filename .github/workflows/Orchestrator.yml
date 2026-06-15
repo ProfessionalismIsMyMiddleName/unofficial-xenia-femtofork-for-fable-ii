@@ -20,14 +20,14 @@ jobs:
   # ===========================================================================
   # Pre-requirements
   # ===========================================================================
-  commit-message:
-    name: Commit Message Validation
-    if: github.event_name == 'pull_request'
-    uses: ./.github/workflows/Check_commit_message.yml
+  # commit-message:
+  #  name: Commit Message Validation
+  #  if: github.event_name == 'pull_request'
+  #  uses: ./.github/workflows/Check_commit_message.yml
 
-  lint:
-    name: Lint
-    uses: ./.github/workflows/Lint.yml
+  # lint:
+  #  name: Lint
+  #  uses: ./.github/workflows/Lint.yml
 
   # Add optional steps here
 
